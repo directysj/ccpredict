@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccpredict"
+version = "0.1.0"
+description = "Predict cell-cycle reporter readout from O2VAE embeddings along single-cell trajectories"
+authors = [{ name = "Jalim" }]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "joblib",
+    "csaps",
+    "imbalanced-learn",
+    "keras>=3",
+    "tensorflow",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+ccpredict = "ccpredict.__main__:main"
+
+[tool.setuptools]
+packages = ["ccpredict"]
