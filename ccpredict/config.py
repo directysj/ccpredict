@@ -13,6 +13,13 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple
 
 
+# Paper: A wells = EGF1, B wells = EGF2, biological replicates of MCF10A + EGF.
+DEFAULT_FOV_REPLICATE = {
+    "A2_1": "EGF1", "A2_2": "EGF1", "A2_3": "EGF1",
+    "B2_1": "EGF2", "B2_3": "EGF2", "B2_4": "EGF2",
+}
+
+
 @dataclass
 class PathsConfig:
     """Where the inputs live. Mirrors pathSet / file_path / ../o2vae in the notebook."""
@@ -114,11 +121,20 @@ class ClassifierConfig:
     oversampling_seed: int = 42
     # NOTEBOOK DEFECT: "keras_tail" oversamples first and then lets Keras take
     # the last 20% as validation. Oversampled duplicates are appended at the
-    # end, so the validation set is copies of minority-class training cells.
-    # "stratified_holdout" splits first and oversamples only the training part.
-    validation: Literal["keras_tail", "stratified_holdout"] = "keras_tail"
+    # end, grouped by class, so the validation set is copies of minority-class
+    # training cells. "grouped_holdout" holds out whole trajectories first and
+    # oversamples only the training part.
+    validation: Literal["keras_tail", "grouped_holdout"] = "keras_tail"
     # The notebook sets no seed, so its training is not reproducible. None keeps that.
     seed: Optional[int] = None
+    # Where the CNN runs. "cpu" hides every GPU from TensorFlow (CUDA and Apple
+    # Metal alike); "gpu" requires one and fails if none is visible; "auto" lets
+    # TensorFlow choose. Default "cpu" while developing on a laptop; switch to
+    # "auto" (or "gpu") for runs on a GPU node.
+    device: Literal["cpu", "gpu", "auto"] = "cpu"
+    # TensorFlow CPU thread pools; None = TensorFlow's default (all cores).
+    tf_intra_op_threads: Optional[int] = None
+    tf_inter_op_threads: Optional[int] = None
     verbose: int = 1
 
 
@@ -132,7 +148,14 @@ class RegressorConfig:
     min_samples_leaf: int = 10
     max_features: str = "sqrt"
     random_state: int = 42
+    # Parallelism. n_jobs is used by every random forest (trees are built in
+    # parallel threads, which scales with cores). rfecv_n_jobs is how many CV
+    # folds RFECV runs at once; inside parallel folds each forest drops to one
+    # thread, so with many cores it is faster to run folds one at a time (1)
+    # and let the trees use all cores. The notebook used -1 for both; results
+    # are the same either way up to float summation order.
     n_jobs: int = -1
+    rfecv_n_jobs: Optional[int] = 1
     cv_splits: int = 5
     cv_seed: int = 42
     rfecv_step: int = 1
@@ -140,8 +163,12 @@ class RegressorConfig:
     scoring: str = "neg_mean_squared_error"
     # NOTEBOOK DEFECT: the regressor is fitted on the test FOV and then
     # evaluated on the same rows, so its MSE/R/R^2 are training-set numbers.
-    # "train" fits on the trimmed training FOVs and evaluates on the test FOV.
-    fit_on: Literal["test", "train"] = "test"
+    # "train" fits on the trimmed training FOVs using the classifier's in-sample
+    # probabilities (over-confident); "train_crossfit" uses out-of-fold
+    # probabilities, one classifier per held-out training FOV (proper stacking).
+    fit_on: Literal["test", "train", "train_crossfit"] = "test"
+    # False replaces RFECV by a single forest on all features (much faster).
+    use_rfecv: bool = True
 
 
 @dataclass

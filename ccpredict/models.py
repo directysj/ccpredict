@@ -70,7 +70,10 @@ class StageOneClassifier:
                                    self.cfg.oversampling_seed)
         return (X, y) if sampler is None else sampler.fit_resample(X, y)
 
-    def fit(self, X: np.ndarray, y_class: np.ndarray) -> "StageOneClassifier":
+    def fit(self, X: np.ndarray, y_class: np.ndarray,
+            groups: Optional[np.ndarray] = None) -> "StageOneClassifier":
+        """Train on (X, y_class). ``groups`` (trajectory ids) is required for grouped_holdout."""
+        self._configure_device()
         import keras
         from keras.callbacks import EarlyStopping
         from keras.optimizers import Adam
@@ -99,12 +102,17 @@ class StageOneClassifier:
             hist = self.model.fit(X_res, onehot(y_res), epochs=cfg.epochs, batch_size=cfg.batch_size,
                                   validation_split=cfg.validation_fraction,
                                   callbacks=[early_stopping], verbose=cfg.verbose)
-        elif cfg.validation == "stratified_holdout":
-            from sklearn.model_selection import train_test_split
+        elif cfg.validation == "grouped_holdout":
+            # Hold out whole trajectories, then oversample only the training part.
+            # Splitting rows at random would put adjacent, near-identical frames
+            # of one cell on both sides and make val_loss optimistic.
+            if groups is None:
+                raise ValueError("validation='grouped_holdout' needs groups (trajectory ids per row)")
+            from sklearn.model_selection import GroupShuffleSplit
 
-            X_tr, X_val, y_tr, y_val = train_test_split(
-                X, y_class, test_size=cfg.validation_fraction, stratify=y_class,
-                random_state=cfg.oversampling_seed)
+            tr, va = next(GroupShuffleSplit(n_splits=1, test_size=cfg.validation_fraction,
+                                            random_state=cfg.oversampling_seed).split(X, y_class, groups))
+            X_tr, X_val, y_tr, y_val = X[tr], X[va], y_class[tr], y_class[va]
             X_res, y_res = self._oversample(X_tr, y_tr)
             hist = self.model.fit(X_res, onehot(y_res), epochs=cfg.epochs, batch_size=cfg.batch_size,
                                   validation_data=(X_val, onehot(y_val)),
@@ -114,6 +122,11 @@ class StageOneClassifier:
 
         self.history = {k: [float(v) for v in vals] for k, vals in hist.history.items()}
         return self
+
+    def _configure_device(self) -> None:
+        from .compute import configure_tensorflow
+
+        configure_tensorflow(self.cfg.device, self.cfg.tf_intra_op_threads, self.cfg.tf_inter_op_threads)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if self.model is None:
@@ -131,14 +144,34 @@ class StageOneClassifier:
 
     @classmethod
     def load(cls, directory: str, cfg: ClassifierConfig) -> "StageOneClassifier":
-        import keras
-
         with open(os.path.join(directory, "stage1_history.json")) as fh:
             meta = json.load(fh)
         obj = cls(cfg, meta["num_classes"])
+        obj._configure_device()
+        import keras
+
         obj.model = keras.models.load_model(os.path.join(directory, "stage1_classifier.keras"))
         obj.history = meta["history"]
         return obj
+
+
+def out_of_fold_proba(X: np.ndarray, y_class: np.ndarray, folds: np.ndarray,
+                      cfg: ClassifierConfig, num_classes: int,
+                      groups: Optional[np.ndarray] = None) -> np.ndarray:
+    """Class probabilities for every row from a classifier that never saw that row's fold.
+
+    With folds = FOV of each training row this is leave-one-FOV-out
+    cross-fitting: the stage-2 model is then trained on probabilities that are
+    as (un)confident as the ones it will see on new FOVs.
+    """
+    proba = np.zeros((X.shape[0], num_classes))
+    for k in np.unique(folds):
+        held = folds == k
+        log.info("out-of-fold classifier: holding out fold %s (%d rows)", k, held.sum())
+        clf = StageOneClassifier(cfg, num_classes).fit(
+            X[~held], y_class[~held], None if groups is None else groups[~held])
+        proba[held] = clf.predict_proba(X[held])
+    return proba
 
 
 # ----------------------------------------------------------------------------
@@ -156,7 +189,8 @@ class StageTwoRegressor:
     The scaler is redundant (inputs are already in [0, 1] or close, and trees
     are invariant to monotone rescaling) but kept for identical numbers.
     RFECV with step=1 from 259 features down to 50 refits a 5-fold forest
-    210 times; that is where the runtime goes.
+    210 times; that is where the runtime goes. Folds run one at a time by
+    default (rfecv_n_jobs=1) so each forest can use every core.
     """
 
     def __init__(self, cfg: RegressorConfig):
@@ -171,11 +205,14 @@ class StageTwoRegressor:
             n_estimators=cfg.n_estimators, max_depth=cfg.max_depth,
             min_samples_split=cfg.min_samples_split, min_samples_leaf=cfg.min_samples_leaf,
             max_features=cfg.max_features, n_jobs=cfg.n_jobs, random_state=cfg.random_state, verbose=0)
+        if not cfg.use_rfecv:
+            self.pipeline = Pipeline([("scaler", MinMaxScaler()), ("forest", forest)])
+            return
         cv = KFold(n_splits=cfg.cv_splits, shuffle=True, random_state=cfg.cv_seed)
         self.pipeline = Pipeline([
             ("scaler", MinMaxScaler()),
             ("rfecv", RFECV(estimator=forest, step=cfg.rfecv_step, cv=cv, scoring=cfg.scoring,
-                            min_features_to_select=cfg.min_features_to_select, n_jobs=cfg.n_jobs)),
+                            min_features_to_select=cfg.min_features_to_select, n_jobs=cfg.rfecv_n_jobs)),
         ])
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "StageTwoRegressor":
@@ -187,7 +224,14 @@ class StageTwoRegressor:
 
     @property
     def rfecv(self):
-        return self.pipeline.named_steps["rfecv"]
+        """The fitted RFECV step, or None when use_rfecv is False."""
+        return self.pipeline.named_steps.get("rfecv")
+
+    @property
+    def n_features_used(self) -> int:
+        if self.rfecv is not None:
+            return int(self.rfecv.n_features_)
+        return int(self.pipeline.named_steps["forest"].n_features_in_)
 
     def save(self, directory: str) -> None:
         import joblib

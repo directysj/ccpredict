@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -71,6 +71,15 @@ class TrainTestData:
     train_rows: np.ndarray     # rows of the concatenated training FOVs that survived trimming
     train_fovs: tuple
     test_fov: str
+    # For grouped validation / cross-fitting / per-trajectory metrics:
+    train_fold: Optional[np.ndarray] = None    # index into train_fovs, per training row
+    train_groups: Optional[np.ndarray] = None  # unique trajectory id across training FOVs
+    test_groups: Optional[np.ndarray] = None   # trajectory index within the test FOV
+
+
+def trajectory_groups(fold: np.ndarray, traj_index: np.ndarray) -> np.ndarray:
+    """One integer per (FOV, trajectory) pair; trajectory indices restart in every FOV."""
+    return np.asarray(fold, dtype=np.int64) * 10_000_000 + np.asarray(traj_index, dtype=np.int64)
 
 
 def build_train_test(fovs: Dict[str, LabeledFOV], split: SplitConfig) -> TrainTestData:
@@ -80,6 +89,8 @@ def build_train_test(fovs: Dict[str, LabeledFOV], split: SplitConfig) -> TrainTe
 
     X_train = np.concatenate([fovs[f].X for f in split.train_fovs], axis=0)
     y_train = np.concatenate([fovs[f].y for f in split.train_fovs], axis=0)
+    fold = np.concatenate([np.full(len(fovs[f].y), i) for i, f in enumerate(split.train_fovs)])
+    traj = np.concatenate([fovs[f].snippets.traj_index for f in split.train_fovs])
 
     rows = trim_by_histogram(y_train, split.trim_bins, split.trim_target_density, split.trim_seed)
     scaler = MinMaxScaler()
@@ -87,4 +98,6 @@ def build_train_test(fovs: Dict[str, LabeledFOV], split: SplitConfig) -> TrainTe
     X_test_scaled = scaler.transform(fovs[split.test_fov].X)
 
     return TrainTestData(X_train_scaled, y_train[rows], X_test_scaled, fovs[split.test_fov].y,
-                         scaler, rows, tuple(split.train_fovs), split.test_fov)
+                         scaler, rows, tuple(split.train_fovs), split.test_fov,
+                         train_fold=fold[rows], train_groups=trajectory_groups(fold[rows], traj[rows]),
+                         test_groups=fovs[split.test_fov].snippets.traj_index.copy())

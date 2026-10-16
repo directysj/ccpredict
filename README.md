@@ -36,9 +36,60 @@ clf = StageOneClassifier.load("results/models/B2_4_trajl1_VAE256Cls3", pipe.conf
 clf, clf_out = pipe.run_classifier(tt, classifier=clf)
 ```
 
+**Compute.** Only the stage-1 CNN uses TensorFlow, and it runs on the CPU by
+default (`classifier.device = "cpu"`, which also hides an Apple Metal GPU).
+Set `"auto"` to let TensorFlow use a GPU when one is present, or `"gpu"` to
+require one. Random forests build their trees in parallel on all cores
+(`regressor.n_jobs = -1`; near-linear: 8.1 s on 1 core, 2.2 s on 4). RFECV runs
+its CV folds one at a time (`regressor.rfecv_n_jobs = 1`) so each forest gets
+every core; running folds in parallel instead caps RFECV at 5 busy cores.
+Both give the same selected features. The CNN gains less from extra cores: its
+steps are tiny, so batch size matters more than core count.
+
 Outputs under `output_dir`: `figs/*.png`, `metrics/performance_<tag>.json`,
 `models/<tag>/` (Keras model, history, joblib regressor). The tag is
 `<testFOV>_trajl<L>_VAE<d>Cls<k>`, the same naming as the notebook's savefig paths.
+
+## Honest evaluation: the benchmark
+
+`python -m ccpredict.benchmark` compares the published model with baselines and
+with corrected protocols, on the same rows. **[RUNNING.md](RUNNING.md) is the
+guide for running it on the real data.**
+
+- **Question (paper):** train on EGF1 (A wells), test on each EGF2 FOV (B wells)
+  separately: `scheme="cross_replicate"`. `"lofo"` (leave one FOV out) and
+  `"fixed"` (the notebook's A→B2_4) are also available.
+- **Grouping:** anything chosen on held-out data inside the training FOVs (CNN
+  early stopping, LASSO alpha, out-of-fold stacking) holds out whole
+  trajectories or whole FOVs, never random rows.
+- **Metrics per test FOV:** the paper's MSE and Pearson R, plus R², Spearman,
+  MAE and R² on log N/C, calibration slope, per-trajectory R (paper Fig. 6),
+  and 95% intervals that resample whole trajectories. For the classifier:
+  accuracy next to the majority-class accuracy, balanced accuracy and macro F1.
+- **Arms:** `constant`, `lasso_classical`, `lasso_vae`, `rf_vae`,
+  `rf_vae_insample`, `published_insample` (the notebook), `published_crossfit`,
+  `published_crossfit_groupedval`. See `ccpredict/arms.py` and RUNNING.md.
+- **Diagnostics** (`diagnostics.json`): trajectory overlap, label distribution
+  per FOV and after trimming, the exact composition of the notebook's Keras
+  validation slice, and forest R under random-row, trajectory, FOV and test
+  splits.
+
+## Synthetic data
+
+There is no data access from here, so development uses a simulator calibrated
+to what is known about the real data (`ccpredict/simulate.py`, docstring lists
+every assumption):
+
+```bash
+python -m ccpredict.simulate sim/ --scale 0.25    # writes the real file layout
+```
+
+It reproduces the B2_4 N/C histogram (digitised from the notebook figure), an
+HDHB-like trace per cycle, size growth and mitotic rounding, an A/B replicate
+shift, celltraj-style trajectories, and the paper's snapshot baselines
+(LASSO R 0.53 VAE, 0.51 classical). It is for correctness and for sizing
+evaluation artefacts. **It cannot say whether a modelling change helps on real
+cells**; that needs the benchmark run on the real data.
 
 ## Notebook to package
 
@@ -70,12 +121,15 @@ notebook.
 
 | Switch | Notebook (default) | Alternative | What the default does |
 |---|---|---|---|
-| `regressor.fit_on` | `"test"` | `"train"` | The forest is fitted on the test FOV and scored on the same rows, so stage-2 MSE/R/R² are training-set numbers. |
-| `classifier.validation` | `"keras_tail"` | `"stratified_holdout"` | The oversampler appends duplicates at the end, grouped by class, and Keras's `validation_split` takes the last 20%. Validation is therefore copies of minority-class training rows, and early stopping (which restores the best weights) is driven by them. |
+| `regressor.fit_on` | `"test"` | `"train_crossfit"` (or `"train"`) | The forest is fitted on the test FOV and scored on the same rows, so stage-2 MSE/R/R² are training-set numbers. `"train_crossfit"` fits it on the training FOVs with out-of-fold CNN probabilities; `"train"` uses the CNN's in-sample probabilities, which are over-confident. |
+| `classifier.validation` | `"keras_tail"` | `"grouped_holdout"` | The oversampler appends duplicates at the end, grouped by class, and Keras's `validation_split` takes the last 20%. Validation is therefore copies of minority-class training rows, and early stopping (which restores the best weights) is driven by them. `"grouped_holdout"` holds out 20% of trajectories before oversampling. |
 | `qc.evaluate_on_frames` | `False` | `True` | The spline is evaluated on a 10,000-point grid and indexed by frame number, so frames 136–190 are compared with the smoothed count at frames ~2.6–3.7. The score is then roughly a coefficient of variation of late counts. If you switch this on, recalibrate `qc.std_cut`: the scores drop about tenfold. |
 | `features.include_last_window` | `False` | `True` | `range(traj_len - seg_length)` drops the last window of every trajectory, and trajectories exactly `trajl` long yield nothing. |
 | `features.label_frame` | `"start_plus_trajl"` | `"snippet_end"` | The label is read at `frame(first cell) + trajl`, one frame after the snippet's last cell. With `trajl=1` that is the next frame's reporter value. |
 | `classifier.seed` | `None` | an int | The notebook sets no seed, so its training is not reproducible. |
+
+`regressor.use_rfecv = False` replaces RFECV by a single forest on all features
+(not a notebook defect, just much faster).
 
 ## Other things to know (no switch, because changing them changes the model)
 
@@ -107,11 +161,13 @@ notebook.
 ## Verification
 
 ```bash
-pytest tests/                                   # rewrites vs verbatim notebook functions
-python tests/synthetic.py /tmp/fx               # synthetic FOVs in the real file layout
+pytest tests/                                   # rewrites vs notebook functions, metrics, splits,
+                                                # diagnostics, simulator, CPU benchmark smoke test
+python tests/synthetic.py /tmp/fx               # small fixture used by the parity check
 python tests/parity/notebook_reference.py vaeFeatCCinfoABwells-NNclfRFreg.ipynb /tmp/fx /tmp/ref.npz
 python tests/parity/package_run.py /tmp/fx /tmp/pkg.npz
 python tests/parity/compare.py /tmp/ref.npz /tmp/pkg.npz
+python tests/parity/benchmark_arm_parity.py /tmp/fx /tmp/ref.npz /tmp/armcheck   # benchmark arm = notebook
 ```
 
 `notebook_reference.py` executes the notebook's own code cells. It changes only
@@ -122,4 +178,7 @@ oversampled set, network probabilities, training history, metrics, confusion
 matrix and RFECV support. The one exception is the forest's predictions, which
 agree to ~1e-15. `RandomForestRegressor.predict` with `n_jobs>1` sums tree
 outputs in thread order, so repeated calls on one fitted model differ by that
-much too.
+much too. `benchmark_arm_parity.py` runs the benchmark's `published_insample`
+arm on the same fixture and checks it against the notebook the same way, so
+the benchmark's "published" row is the notebook's model, not a re-implementation
+that might differ.

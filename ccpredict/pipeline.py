@@ -22,7 +22,7 @@ import numpy as np
 from . import evaluation as ev
 from .config import PipelineConfig
 from .data import PreparedData, prepare_data
-from .models import StageOneClassifier, StageTwoRegressor, stack_features
+from .models import StageOneClassifier, StageTwoRegressor, out_of_fold_proba, stack_features
 from .preprocessing import TrainTestData, build_train_test, discretize
 
 log = logging.getLogger(__name__)
@@ -104,7 +104,8 @@ class CellCyclePipeline:
         y_test_class = discretize(tt.y_test, cfg.class_boundaries)
 
         if classifier is None:
-            classifier = StageOneClassifier(cfg, num_classes).fit(tt.X_train, y_train_class)
+            classifier = StageOneClassifier(cfg, num_classes).fit(tt.X_train, y_train_class,
+                                                                  groups=tt.train_groups)
         proba = classifier.predict_proba(tt.X_test)
         predicted = np.argmax(proba, axis=1)
         metrics = ev.classification_metrics(y_test_class, predicted, num_classes)
@@ -129,13 +130,19 @@ class CellCyclePipeline:
             # probabilities would remove that mismatch.
             X_fit = stack_features(tt.X_train, classifier.predict_proba(tt.X_train))
             y_fit = tt.y_train
+        elif cfg.fit_on == "train_crossfit":
+            clf_cfg = self.config.classifier
+            y_class = discretize(tt.y_train, clf_cfg.class_boundaries)
+            oof = out_of_fold_proba(tt.X_train, y_class, tt.train_fold, clf_cfg,
+                                    len(clf_cfg.class_boundaries) + 1, groups=tt.train_groups)
+            X_fit, y_fit = stack_features(tt.X_train, oof), tt.y_train
         else:
             raise ValueError(f"unknown fit_on {cfg.fit_on!r}")
 
         regressor = StageTwoRegressor(cfg).fit(X_fit, y_fit)
         y_pred = regressor.predict(X_eval)
         metrics = ev.regression_metrics(tt.y_test, y_pred)
-        metrics["n_features_selected"] = int(regressor.rfecv.n_features_)
+        metrics["n_features_selected"] = regressor.n_features_used
         log.info("stage 2 on %s (fit_on=%s): MSE %.3f, R %.3f, R^2 %.3f", tt.test_fov,
                  cfg.fit_on, metrics["mse"], metrics["pearson_r"], metrics["r2"])
         return regressor, RegressorOutput(X_fit, y_fit, X_eval, tt.y_test, y_pred, metrics, cfg.fit_on)
@@ -162,7 +169,8 @@ class CellCyclePipeline:
             if make_figures:
                 self._figure(figs, "ratioN2C_RF-NN", ev.plot_regression(
                     reg_out.y_eval, reg_out.y_pred, f"RF on VAE + NN probabilities: {tt.test_fov}"))
-                self._figure(figs, "ratioN2C_RF-NN_score", ev.plot_rfecv_scores(regressor.rfecv))
+                if regressor.rfecv is not None:
+                    self._figure(figs, "ratioN2C_RF-NN_score", ev.plot_rfecv_scores(regressor.rfecv))
 
         self.save(results)
         return results

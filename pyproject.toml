@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ccpredict"
 version = "0.1.0"
-description = "Predict cell-cycle reporter readout from O2VAE embeddings along single-cell trajectories"
+description = "Predict cell-cycle reporter readout from O2VAE embeddings along with single-cell trajectories"
 authors = [{ name = "Jalim" }]
 requires-python = ">=3.9"
 dependencies = [
