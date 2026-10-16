@@ -1,6 +1,12 @@
 """Run the package on the synthetic fixture with settings matching notebook_reference.py.
 
-    python tests/parity/package_run.py FIXTURE_DIR OUT.npz [--epochs 4 --seed 123 ...]
+    python tests/parity/package_run.py FIXTURE_DIR OUT.npz [--stage1-from REF.npz]
+
+Stage 1 is PyTorch, so its outputs cannot equal the notebook's Keras outputs
+bit for bit. With --stage1-from, stage 2 is run on the notebook's own class
+probabilities (y_pred_nn from notebook_reference.py), which makes everything
+except the CNN itself checkable exactly; compare.py then skips only the
+stage-1 arrays.
 """
 from __future__ import annotations
 
@@ -21,13 +27,12 @@ def main() -> None:
     ap.add_argument("--n-estimators", type=int, default=20)
     ap.add_argument("--min-features", type=int, default=254)
     ap.add_argument("--output-dir", default=None)
+    ap.add_argument("--stage1-from", default=None, help="notebook REF.npz whose y_pred_nn feeds stage 2")
     args = ap.parse_args()
 
     import matplotlib
     matplotlib.use("Agg")
     import numpy as np
-    import tensorflow as tf
-    tf.config.experimental.enable_op_determinism()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     from ccpredict import CellCyclePipeline, PipelineConfig
@@ -45,8 +50,18 @@ def main() -> None:
     cfg.regressor.min_features_to_select = args.min_features
 
     pipe = CellCyclePipeline(cfg)
-    res = pipe.run(make_figures=args.output_dir is not None)
-    tt, co, ro = res.train_test, res.classifier_output, res.regressor_output
+    data = pipe.prepare_data()
+    tt = pipe.build_train_test(data)
+    clf, co = pipe.run_classifier(tt)
+    proba_for_stage2 = co.proba_test
+    if args.stage1_from:
+        proba_for_stage2 = np.load(args.stage1_from)["y_pred_nn"]
+    reg, ro = pipe.run_regressor(tt, clf, proba_for_stage2)
+
+    class _Res:  # same fields as PipelineResults
+        pass
+    res = _Res()
+    res.data, res.classifier, res.regressor = data, clf, reg
     X_res, y_res = make_oversampler(cfg.classifier.oversampler, cfg.classifier.oversampling_strategy,
                                     cfg.classifier.oversampling_seed).fit_resample(tt.X_train, co.y_train_class)
 

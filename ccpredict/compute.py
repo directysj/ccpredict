@@ -1,50 +1,40 @@
-"""Choose where TensorFlow runs (only the stage-1 CNN uses TensorFlow).
-
-TensorFlow fixes its devices the first time it runs an op, so this must be
-called before any model is built. StageOneClassifier does that itself, so
-users normally only set ``ClassifierConfig.device``.
-"""
+"""Choose where PyTorch runs (only the stage-1 CNN uses PyTorch)."""
 from __future__ import annotations
 
 import logging
 from typing import Optional
 
 log = logging.getLogger(__name__)
-_applied: Optional[tuple] = None
+_threads_applied: Optional[int] = None
 
 
-def configure_tensorflow(device: str = "cpu", intra_op_threads: Optional[int] = None,
-                         inter_op_threads: Optional[int] = None) -> str:
-    """Apply the device choice; returns a short description of what TensorFlow will use.
+def select_device(device: str = "cpu", num_threads: Optional[int] = None):
+    """Return the torch.device for ``device`` and apply the CPU thread setting.
 
-    device="cpu"   hide all GPUs (CUDA or Apple Metal) from TensorFlow
-    device="gpu"   require at least one GPU; raise if there is none
-    device="auto"  leave TensorFlow's default (GPU if one is visible)
+    device="cpu"   CPU only
+    device="gpu"   CUDA if available, else Apple Metal (MPS); raises if neither
+    device="auto"  CUDA > MPS > CPU
     """
-    global _applied
+    import torch
+
+    global _threads_applied
     if device not in ("cpu", "gpu", "auto"):
         raise ValueError(f"device must be 'cpu', 'gpu' or 'auto', not {device!r}")
-    key = (device, intra_op_threads, inter_op_threads)
+    if num_threads and num_threads != _threads_applied:
+        torch.set_num_threads(num_threads)
+        _threads_applied = num_threads
 
-    import tensorflow as tf
-
-    if _applied != key:
-        gpus = tf.config.list_physical_devices("GPU")
-        if device == "gpu" and not gpus:
-            raise RuntimeError("device='gpu' but TensorFlow sees no GPU; use 'cpu' or 'auto'")
-        try:
-            if device == "cpu" and gpus:
-                tf.config.set_visible_devices([], "GPU")
-            if intra_op_threads:
-                tf.config.threading.set_intra_op_parallelism_threads(intra_op_threads)
-            if inter_op_threads:
-                tf.config.threading.set_inter_op_parallelism_threads(inter_op_threads)
-        except RuntimeError as exc:  # TensorFlow already initialised in this process
-            log.warning("could not apply device=%r (%s); TensorFlow keeps its current devices",
-                        device, exc)
-        _applied = key
-
-    visible_gpus = tf.config.get_visible_devices("GPU")
-    desc = f"TensorFlow on {'GPU x%d' % len(visible_gpus) if visible_gpus else 'CPU'} (device={device!r})"
-    log.info(desc)
-    return desc
+    has_cuda = torch.cuda.is_available()
+    has_mps = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+    if device == "cpu":
+        dev = torch.device("cpu")
+    elif has_cuda:
+        dev = torch.device("cuda")
+    elif has_mps:
+        dev = torch.device("mps")
+    elif device == "gpu":
+        raise RuntimeError("device='gpu' but PyTorch sees neither CUDA nor Apple MPS; use 'cpu' or 'auto'")
+    else:
+        dev = torch.device("cpu")
+    log.info("PyTorch on %s (device=%r, %d CPU threads)", dev, device, torch.get_num_threads())
+    return dev

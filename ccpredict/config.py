@@ -102,7 +102,12 @@ class SplitConfig:
 
 @dataclass
 class ClassifierConfig:
-    """Stage 1: CNN+DNN classifier of binned N/C ratio (In [25], [27], [32]-[37])."""
+    """Stage 1: CNN+DNN classifier of binned N/C ratio (In [25], [27], [32]-[37]).
+
+    Implemented in PyTorch with the notebook's Keras defaults reproduced
+    (see models.py): Glorot init, BatchNorm momentum 0.99 / eps 1e-3, LeakyReLU
+    slope 0.3, L1/L2 penalties added to the loss, Keras-style Adam (eps 1e-7).
+    """
 
     class_boundaries: Tuple[float, ...] = (0.9, 2.7)
     conv_filters: Tuple[int, ...] = (32, 64)
@@ -119,22 +124,21 @@ class ClassifierConfig:
     oversampler: Literal["random", "smote", "kmeans_smote", "adasyn", "none"] = "random"
     oversampling_strategy: str = "not majority"
     oversampling_seed: int = 42
-    # NOTEBOOK DEFECT: "keras_tail" oversamples first and then lets Keras take
-    # the last 20% as validation. Oversampled duplicates are appended at the
-    # end, grouped by class, so the validation set is copies of minority-class
-    # training cells. "grouped_holdout" holds out whole trajectories first and
-    # oversamples only the training part.
+    # NOTEBOOK DEFECT: "keras_tail" oversamples first and then takes the last
+    # 20% as validation, as Keras' validation_split did in the notebook.
+    # Oversampled duplicates are appended at the end, grouped by class, so the
+    # validation set is copies of minority-class training cells.
+    # "grouped_holdout" holds out whole trajectories first and oversamples only
+    # the training part.
     validation: Literal["keras_tail", "grouped_holdout"] = "keras_tail"
     # The notebook sets no seed, so its training is not reproducible. None keeps that.
     seed: Optional[int] = None
-    # Where the CNN runs. "cpu" hides every GPU from TensorFlow (CUDA and Apple
-    # Metal alike); "gpu" requires one and fails if none is visible; "auto" lets
-    # TensorFlow choose. Default "cpu" while developing on a laptop; switch to
-    # "auto" (or "gpu") for runs on a GPU node.
+    # Where the CNN runs. "cpu"; "gpu" = CUDA, else Apple Metal (MPS), and fails
+    # if neither exists; "auto" = CUDA > MPS > CPU. Default "cpu" while
+    # developing on a laptop; switch to "auto" (or "gpu") for a GPU node.
     device: Literal["cpu", "gpu", "auto"] = "cpu"
-    # TensorFlow CPU thread pools; None = TensorFlow's default (all cores).
-    tf_intra_op_threads: Optional[int] = None
-    tf_inter_op_threads: Optional[int] = None
+    # PyTorch CPU threads; None = PyTorch's default (all cores).
+    num_threads: Optional[int] = None
     verbose: int = 1
 
 
@@ -172,6 +176,80 @@ class RegressorConfig:
 
 
 @dataclass
+class NetConfig:
+    """A one-stage neural regressor of the N/C ratio: no class bins, no forest.
+
+    This is not part of the notebook. It exists because the published pipeline
+    turns a continuous, strongly skewed target into three bins of which the
+    middle one holds ~97% of the rows, and then feeds the resulting class
+    probabilities to a forest. Here the network predicts the ratio itself.
+
+    The architecture switches below are deliberate departures from the
+    notebook's, each isolated by its own benchmark arm:
+
+    encoder="mlp"
+        The notebook convolves a (3,) kernel along the *latent index* of the
+        VAE embedding. That index has no ordering: dimension 7 is not a
+        neighbour of dimension 8, so the kernel mixes three arbitrary
+        dimensions and weight sharing across the 256 of them has no meaning.
+        An MLP on the same features makes no such assumption.
+    norm_position="before_activation"
+        The notebook normalises after the activation. Normalising before it is
+        the usual order and is what makes the conv bias provably redundant
+        (BatchNorm subtracts the batch mean, so a per-channel constant is
+        removed), hence conv_bias=False. Set "after_activation" to measure the
+        notebook's order with everything else held fixed.
+    regularizers
+        The notebook's l2 0.01 / l1 0.02 on every layer gives a penalty of
+        about 13 at initialisation against a cross-entropy of about 1.1, i.e.
+        92% of the loss is the penalty. Default here is a single light l2.
+    """
+
+    # ---- the task ----
+    head: Literal["regression", "histogram"] = "regression"
+    # "identity" fits the raw ratio, "log" fits log(N/C) and exponentiates back.
+    # The ratio is positive and right-skewed, so "log" makes the residuals more
+    # nearly homoscedastic; metrics are always reported on the raw ratio.
+    target_transform: Literal["identity", "log"] = "identity"
+    loss: Literal["mse", "huber"] = "mse"
+    huber_delta: float = 1.0
+    # head="histogram": cross-entropy over equal-count (quantile) bins of the
+    # training labels, predicting the expectation sum_k p_k * mean(y in bin k).
+    # Equal-count bins remove the class imbalance by construction; the
+    # expectation keeps the prediction continuous.
+    n_bins: int = 32
+    # "inverse_density" weights each row by 1 / (density of its label), the
+    # regression analogue of the notebook's minority-class oversampling.
+    label_weighting: Literal["none", "inverse_density"] = "none"
+    weight_clip: float = 10.0
+
+    # ---- the network ----
+    encoder: Literal["mlp", "conv"] = "mlp"
+    norm_position: Literal["before_activation", "after_activation"] = "before_activation"
+    conv_bias: bool = False
+    conv_filters: Tuple[int, ...] = (32, 64)
+    dense_units: Tuple[int, ...] = (128, 64)
+    dropout: float = 0.2
+    regularizers: Tuple[Tuple[str, float], ...] = (("l2", 1e-4),)
+
+    # ---- training ----
+    learning_rate: float = 1e-3
+    epochs: int = 200
+    batch_size: int = 128
+    # Early stopping holds out whole trajectories ("grouped_holdout"); random
+    # rows would put adjacent frames of one cell on both sides.
+    validation: Literal["grouped_holdout", "random_rows"] = "grouped_holdout"
+    validation_fraction: float = 0.2
+    validation_seed: int = 42
+    patience: int = 20
+    min_delta: float = 1e-4
+    seed: Optional[int] = 0
+    device: Literal["cpu", "gpu", "auto"] = "cpu"
+    num_threads: Optional[int] = None
+    verbose: int = 1
+
+
+@dataclass
 class PipelineConfig:
     fovs: Tuple[str, ...] = ("A2_1", "A2_2", "A2_3", "B2_1", "B2_3", "B2_4")
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -180,6 +258,8 @@ class PipelineConfig:
     split: SplitConfig = field(default_factory=SplitConfig)
     classifier: ClassifierConfig = field(default_factory=ClassifierConfig)
     regressor: RegressorConfig = field(default_factory=RegressorConfig)
+    # Used only by the nn_* benchmark arms; the notebook pipeline ignores it.
+    net: NetConfig = field(default_factory=NetConfig)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -198,8 +278,20 @@ class PipelineConfig:
             return cls.from_dict(json.load(fh))
 
 
+# Keys that older configs may contain: old name -> new name (None = dropped).
+_RENAMED_KEYS = {
+    "ClassifierConfig": {"tf_intra_op_threads": "num_threads", "tf_inter_op_threads": None},
+}
+
+
 def _from_dict(cls, d: dict):
     """Build a (nested) dataclass from a dict, turning JSON lists back into tuples."""
+    d = dict(d)
+    for old, new in _RENAMED_KEYS.get(cls.__name__, {}).items():
+        if old in d:
+            value = d.pop(old)
+            if new is not None and new not in d:
+                d[new] = value
     known = {f.name: f for f in dataclasses.fields(cls)}
     unknown = set(d) - set(known)
     if unknown:

@@ -12,6 +12,22 @@ every test FOV of that split.
                                   probabilities, scored on the test FOVs
     published_crossfit_groupedval as published_crossfit, but the CNN's early stopping uses held-out
                                   trajectories instead of the oversampled tail
+
+One-stage neural regressors (no class bins, no forest; see NetConfig). All are fit
+on the training FOVs and scored on the test FOVs:
+
+    nn_mlp                        MLP, squared loss on the N/C ratio
+    nn_mlp_log                    same, fitting log(N/C)
+    nn_mlp_huber                  same, Huber loss (the ratio has a long upper tail)
+    nn_mlp_hist                   MLP, cross-entropy over 32 equal-count bins of N/C,
+                                  predicting the expectation
+    nn_mlp_weighted               nn_mlp with rows weighted by 1 / label density
+    nn_conv                       the notebook's conv encoder, BatchNorm before the
+                                  activation and no conv bias: does the convolution help?
+    nn_conv_notebook_bn           as nn_conv but with the notebook's BatchNorm order and
+                                  conv bias, to price that choice on its own
+    nn_mlp_heavy_reg              nn_mlp with the notebook's l2 0.01 / l1 0.02 penalties,
+                                  to price those on their own
 """
 from __future__ import annotations
 
@@ -23,7 +39,7 @@ from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
-from .config import ClassifierConfig, RegressorConfig
+from .config import ClassifierConfig, NetConfig, RegressorConfig
 from .preprocessing import discretize
 
 log = logging.getLogger(__name__)
@@ -69,6 +85,7 @@ class SplitContext:
     columns: Callable[[str], np.ndarray]
     classifier_cfg: ClassifierConfig
     regressor_cfg: RegressorConfig
+    net_cfg: NetConfig = field(default_factory=NetConfig)
     cache: dict = field(default_factory=dict)
 
     def X_train(self, feature_set: str) -> np.ndarray:
@@ -166,6 +183,21 @@ class ForestArm(Arm):
 # The published two-stage model
 # ----------------------------------------------------------------------------
 
+def scaled_vae_features(ctx):
+    """MinMax-scaled VAE features, scaler fit on the (trimmed) training block as in the notebook.
+
+    Cached on the split, so every network arm sees exactly the same matrices.
+    """
+    key = ("minmax",)
+    if key not in ctx.cache:
+        from sklearn.preprocessing import MinMaxScaler
+
+        scaler = MinMaxScaler().fit(ctx.X_train("vae"))
+        ctx.cache[key] = (scaler.transform(ctx.X_train("vae")),
+                          {f: scaler.transform(ctx.X_test(f, "vae")) for f in ctx.tests})
+    return ctx.cache[key]
+
+
 class PublishedArm(Arm):
     """Notebook stage 1 (CNN on MinMax-scaled VAE features) + stage 2 (RFECV forest).
 
@@ -185,14 +217,7 @@ class PublishedArm(Arm):
             self.name += "_groupedval"
 
     def _scaled(self, ctx):
-        key = ("minmax",)
-        if key not in ctx.cache:
-            from sklearn.preprocessing import MinMaxScaler
-
-            scaler = MinMaxScaler().fit(ctx.X_train("vae"))
-            ctx.cache[key] = (scaler.transform(ctx.X_train("vae")),
-                              {f: scaler.transform(ctx.X_test(f, "vae")) for f in ctx.tests})
-        return ctx.cache[key]
+        return scaled_vae_features(ctx)
 
     def _clf_cfg(self, ctx) -> ClassifierConfig:
         cfg = copy.deepcopy(ctx.classifier_cfg)
@@ -231,8 +256,8 @@ class PublishedArm(Arm):
         clf, clf_seconds = self._classifier(ctx)
         info = {"classifier_epochs": len(clf.history.get("loss", [])),
                 "classifier_seconds": round(clf_seconds, 1)}
-        if "val_loss" in clf.history and clf.history["val_loss"]:
-            info["classifier_best_epoch"] = int(np.argmin(clf.history["val_loss"])) + 1
+        if clf.history.get("best_epoch"):
+            info["classifier_best_epoch"] = int(clf.history["best_epoch"][0])
         proba = {f: clf.predict_proba(Xs_test[f]) for f in ctx.tests}
 
         out = {}
@@ -250,8 +275,66 @@ class PublishedArm(Arm):
 
 
 # ----------------------------------------------------------------------------
+# One-stage neural regressors
+# ----------------------------------------------------------------------------
+
+class NeuralArm(Arm):
+    """One network, MinMax-scaled VAE features in, N/C ratio out.
+
+    Fit on the training block (minus the trajectories early stopping holds out)
+    and scored on each test FOV. ``overrides`` are applied to the run's
+    NetConfig, so one arm differs from another only by what its name says.
+    """
+
+    feature_sets = ("vae",)
+
+    def __init__(self, name: str, **overrides):
+        self.name = name
+        self.overrides = overrides
+
+    def cfg(self, ctx) -> NetConfig:
+        cfg = copy.deepcopy(ctx.net_cfg)
+        for key, value in self.overrides.items():
+            if not hasattr(cfg, key):
+                raise KeyError(f"{self.name}: NetConfig has no field {key!r}")
+            setattr(cfg, key, value)
+        return cfg
+
+    def run(self, ctx):
+        from .models import DirectRegressor
+
+        Xs_train, Xs_test = scaled_vae_features(ctx)
+        cfg = self.cfg(ctx)
+        t0 = time.time()
+        model = DirectRegressor(cfg).fit(Xs_train, ctx.train.y, ctx.train.groups)
+        info = {"net_epochs": len(model.history.get("loss", [])),
+                "net_best_epoch": int(model.history["best_epoch"][0]),
+                "net_seconds": round(time.time() - t0, 1),
+                "net_encoder": cfg.encoder, "net_head": cfg.head}
+        return {f: ArmResult(model.predict(Xs_test[f]), info=dict(info)) for f in ctx.tests}
+
+
+NOTEBOOK_REGULARIZERS = (("l2", 0.01), ("l1", 0.02))
+
+
+# ----------------------------------------------------------------------------
 # Registry
 # ----------------------------------------------------------------------------
+
+NEURAL_ARMS: Dict[str, dict] = {
+    # Fix 1: the task. Regress the ratio instead of binning it.
+    "nn_mlp": {},
+    "nn_mlp_log": {"target_transform": "log"},
+    "nn_mlp_huber": {"loss": "huber"},
+    "nn_mlp_hist": {"head": "histogram"},
+    "nn_mlp_weighted": {"label_weighting": "inverse_density"},
+    # Fix 2: the architecture. Does the convolution along the latent index earn its cost?
+    "nn_conv": {"encoder": "conv"},
+    # Ablations of the notebook's two choices, one at a time.
+    "nn_conv_notebook_bn": {"encoder": "conv", "norm_position": "after_activation",
+                            "conv_bias": True},
+    "nn_mlp_heavy_reg": {"regularizers": NOTEBOOK_REGULARIZERS},
+}
 
 ARMS: Dict[str, Callable[[], Arm]] = {
     "constant": ConstantArm,
@@ -262,6 +345,7 @@ ARMS: Dict[str, Callable[[], Arm]] = {
     "published_insample": lambda: PublishedArm("test", "keras_tail"),
     "published_crossfit": lambda: PublishedArm("train_crossfit", "keras_tail"),
     "published_crossfit_groupedval": lambda: PublishedArm("train_crossfit", "grouped_holdout"),
+    **{name: (lambda n=name, o=over: NeuralArm(n, **o)) for name, over in NEURAL_ARMS.items()},
 }
 
 DEFAULT_ARMS: List[str] = list(ARMS)

@@ -16,7 +16,7 @@ listed below.
 ## Install and run
 
 ```bash
-pip install -e .                                   # needs csaps, imbalanced-learn, keras + tensorflow
+pip install -e .                                   # needs torch>=2.5, csaps, imbalanced-learn
 python -m ccpredict --write-config config.json     # default = notebook settings; edit paths
 python -m ccpredict --config config.json --output-dir results/
 ```
@@ -36,10 +36,20 @@ clf = StageOneClassifier.load("results/models/B2_4_trajl1_VAE256Cls3", pipe.conf
 clf, clf_out = pipe.run_classifier(tt, classifier=clf)
 ```
 
-**Compute.** Only the stage-1 CNN uses TensorFlow, and it runs on the CPU by
-default (`classifier.device = "cpu"`, which also hides an Apple Metal GPU).
-Set `"auto"` to let TensorFlow use a GPU when one is present, or `"gpu"` to
-require one. Random forests build their trees in parallel on all cores
+**Stage 1 is PyTorch.** The notebook's Keras model and training loop are
+reproduced in `ccpredict/cnn.py` with every Keras default the notebook relied
+on made explicit (Glorot init, BatchNorm momentum 0.99 / eps 1e-3, LeakyReLU
+0.3, L1/L2 penalties in the loss and in val_loss, Keras' Adam, `validation_split`,
+Keras 3 early stopping). TensorFlow is no longer needed except for the parity
+checks in `tests/parity` (`pip install -e .[parity]`). How the port was
+checked is under Verification.
+
+**Compute.** Only the stage-1 CNN uses PyTorch, and it runs on the CPU by
+default (`classifier.device = "cpu"`). `"auto"` picks CUDA, then Apple Metal
+(MPS), then CPU; `"gpu"` requires CUDA or MPS. `classifier.num_threads` caps
+PyTorch's CPU threads (default: PyTorch's own choice, all physical cores).
+Old configs with `tf_intra_op_threads` still load; it is read as `num_threads`.
+Random forests build their trees in parallel on all cores
 (`regressor.n_jobs = -1`; near-linear: 8.1 s on 1 core, 2.2 s on 4). RFECV runs
 its CV folds one at a time (`regressor.rfecv_n_jobs = 1`) so each forest gets
 every core; running folds in parallel instead caps RFECV at 5 busy cores.
@@ -47,7 +57,7 @@ Both give the same selected features. The CNN gains less from extra cores: its
 steps are tiny, so batch size matters more than core count.
 
 Outputs under `output_dir`: `figs/*.png`, `metrics/performance_<tag>.json`,
-`models/<tag>/` (Keras model, history, joblib regressor). The tag is
+`models/<tag>/` (`stage1_classifier.pt` state dict, history, joblib regressor). The tag is
 `<testFOV>_trajl<L>_VAE<d>Cls<k>`, the same naming as the notebook's savefig paths.
 
 ## Honest evaluation: the benchmark
@@ -68,11 +78,58 @@ guide for running it on the real data.**
   accuracy next to the majority-class accuracy, balanced accuracy and macro F1.
 - **Arms:** `constant`, `lasso_classical`, `lasso_vae`, `rf_vae`,
   `rf_vae_insample`, `published_insample` (the notebook), `published_crossfit`,
-  `published_crossfit_groupedval`. See `ccpredict/arms.py` and RUNNING.md.
+  `published_crossfit_groupedval`, plus the one-stage networks below. See
+  `ccpredict/arms.py` and RUNNING.md.
 - **Diagnostics** (`diagnostics.json`): trajectory overlap, label distribution
   per FOV and after trimming, the exact composition of the notebook's Keras
   validation slice, and forest R under random-row, trajectory, FOV and test
   splits.
+
+## One-stage neural regressors
+
+The published model turns a continuous, strongly skewed target into three bins
+of which the middle one holds ~97% of the rows, then feeds the class
+probabilities to a forest. The `nn_*` arms replace both stages with a single
+network that predicts the ratio itself. Everything they share lives in
+`NetConfig` (`ccpredict/config.py`), and each arm differs from `nn_mlp` by
+exactly the fields its name mentions, which `tests/test_evaluation.py` checks:
+
+| arm | what it changes |
+|---|---|
+| `nn_mlp` | MLP on the same MinMax-scaled VAE features, squared loss on N/C |
+| `nn_mlp_log` | fits log(N/C); metrics stay on the raw ratio |
+| `nn_mlp_huber` | Huber loss, for the long upper tail |
+| `nn_mlp_hist` | cross-entropy over 32 equal-count bins, predicting `sum_k p_k * mean(y in bin k)` |
+| `nn_mlp_weighted` | rows weighted by 1 / label density (the regression analogue of oversampling) |
+| `nn_conv` | the notebook's conv encoder, BatchNorm before the activation, no conv bias |
+| `nn_conv_notebook_bn` | as `nn_conv` with the notebook's BatchNorm order and conv bias |
+| `nn_mlp_heavy_reg` | `nn_mlp` with the notebook's l2 0.01 / l1 0.02 penalties |
+
+Three departures from the notebook are defaults here, each with its own
+ablation arm so the cost of the original choice is visible:
+
+- **No convolution.** The notebook convolves a (3,) kernel along the *latent
+  index* of the VAE embedding, an index with no ordering: dimension 7 is not a
+  neighbour of dimension 8. Weight sharing across the 256 of them encodes an
+  adjacency that does not exist. `nn_conv` keeps the convolution to price it.
+- **BatchNorm before the activation**, and therefore no conv bias: BatchNorm
+  subtracts the batch mean, so a per-channel constant in front of it cannot
+  change any output. `nn_conv_notebook_bn` keeps the notebook's order.
+- **Light regularisation.** The notebook's l2 0.01 / l1 0.02 on every layer is
+  a penalty of ~13 at initialisation against a cross-entropy of ~1.1, so 92% of
+  the loss is the penalty. `nn_mlp_heavy_reg` keeps it.
+
+Early stopping holds out whole trajectories (`validation="grouped_holdout"`),
+and a regression head's output bias starts at the mean training target, so
+epoch 0 is the constant baseline rather than a drift towards it.
+
+**What these scored on the simulator** is in
+[results/simulator_tweaks.md](results/simulator_tweaks.md), with the seed
+spread of each arm (differences below ~0.01 R are noise) and a measurement of
+how much signal is left to win. In short: `nn_mlp_hist` was the best of them,
+the convolution costs 0.05 R and 18x the runtime, the notebook's penalties
+collapse a regression net to a constant, and the single largest gain available
+anywhere was fixing `features.label_frame`, not changing the model.
 
 ## Synthetic data
 
@@ -124,8 +181,8 @@ notebook.
 | `regressor.fit_on` | `"test"` | `"train_crossfit"` (or `"train"`) | The forest is fitted on the test FOV and scored on the same rows, so stage-2 MSE/R/R² are training-set numbers. `"train_crossfit"` fits it on the training FOVs with out-of-fold CNN probabilities; `"train"` uses the CNN's in-sample probabilities, which are over-confident. |
 | `classifier.validation` | `"keras_tail"` | `"grouped_holdout"` | The oversampler appends duplicates at the end, grouped by class, and Keras's `validation_split` takes the last 20%. Validation is therefore copies of minority-class training rows, and early stopping (which restores the best weights) is driven by them. `"grouped_holdout"` holds out 20% of trajectories before oversampling. |
 | `qc.evaluate_on_frames` | `False` | `True` | The spline is evaluated on a 10,000-point grid and indexed by frame number, so frames 136–190 are compared with the smoothed count at frames ~2.6–3.7. The score is then roughly a coefficient of variation of late counts. If you switch this on, recalibrate `qc.std_cut`: the scores drop about tenfold. |
-| `features.include_last_window` | `False` | `True` | `range(traj_len - seg_length)` drops the last window of every trajectory, and trajectories exactly `trajl` long yield nothing. |
-| `features.label_frame` | `"start_plus_trajl"` | `"snippet_end"` | The label is read at `frame(first cell) + trajl`, one frame after the snippet's last cell. With `trajl=1` that is the next frame's reporter value. |
+| `features.include_last_window` | `False` | `True` | `range(traj_len - seg_length)` drops the last window of every trajectory, and trajectories exactly `trajl` long yield nothing. On its own this switch changes nothing: the last window's label is read past the end of the trajectory, so that row is dropped as unlabelled either way. Fixing `label_frame` recovers those rows as well. |
+| `features.label_frame` | `"start_plus_trajl"` | `"snippet_end"` | The label is read at `frame(first cell) + trajl`, one frame after the snippet's last cell. With `trajl=1` that is the next frame's reporter value, so the model is scored on predicting the reporter 15 min into the future from the current morphology. **On the simulator this costs 0.03-0.05 R for every arm** ([results/simulator_tweaks.md](results/simulator_tweaks.md)), which is more than any model change tried so far. |
 | `classifier.seed` | `None` | an int | The notebook sets no seed, so its training is not reproducible. |
 
 `regressor.use_rfecv = False` replaces RFECV by a single forest on all features
@@ -162,23 +219,80 @@ notebook.
 
 ```bash
 pytest tests/                                   # rewrites vs notebook functions, metrics, splits,
-                                                # diagnostics, simulator, CPU benchmark smoke test
-python tests/synthetic.py /tmp/fx               # small fixture used by the parity check
+                                                # diagnostics, simulator, network determinism, benchmark smoke test
+python tests/synthetic.py /tmp/fx               # small fixture used by the parity checks
+python tests/seed_spread.py BENCH.json out --arms nn_mlp,nn_mlp_hist --seeds 5   # is a gap bigger than the seed?
+python tests/ceiling.py sim/simulation.json     # how much signal is there to win? (simulated data only)
+# The rest needs TensorFlow + Keras 3 as well (pip install -e .[parity]):
 python tests/parity/notebook_reference.py vaeFeatCCinfoABwells-NNclfRFreg.ipynb /tmp/fx /tmp/ref.npz
-python tests/parity/package_run.py /tmp/fx /tmp/pkg.npz
+python tests/parity/package_run.py /tmp/fx /tmp/pkg.npz --stage1-from /tmp/ref.npz
 python tests/parity/compare.py /tmp/ref.npz /tmp/pkg.npz
 python tests/parity/benchmark_arm_parity.py /tmp/fx /tmp/ref.npz /tmp/armcheck   # benchmark arm = notebook
+pytest tests/parity/test_torch_port.py          # PyTorch CNN = Keras CNN, step by step
+python tests/parity/torch_vs_keras.py BENCH.json /tmp/tvk --seeds 10 --max-train-rows 8000
 ```
 
+**Everything except the CNN is checked bit for bit against the notebook.**
 `notebook_reference.py` executes the notebook's own code cells. It changes only
 the paths, the epoch count, the seed and the forest size, and asserts that each
-of those edits matches exactly once. On the synthetic data every array matches
-bit for bit: QC scores, per-FOV features and labels, trimmed and scaled sets,
-oversampled set, network probabilities, training history, metrics, confusion
-matrix and RFECV support. The one exception is the forest's predictions, which
-agree to ~1e-15. `RandomForestRegressor.predict` with `n_jobs>1` sums tree
-outputs in thread order, so repeated calls on one fitted model differ by that
-much too. `benchmark_arm_parity.py` runs the benchmark's `published_insample`
-arm on the same fixture and checks it against the notebook the same way, so
-the benchmark's "published" row is the notebook's model, not a re-implementation
-that might differ.
+of those edits matches exactly once. With `--stage1-from`, `package_run.py`
+feeds the notebook's own class probabilities into stage 2, and on the synthetic
+data every other array matches bit for bit: QC scores, per-FOV features and
+labels, trimmed and scaled sets, oversampled set, RFECV support and metrics. The
+one exception is the forest's predictions, which agree to ~1e-15.
+`RandomForestRegressor.predict` with `n_jobs>1` sums tree outputs in thread
+order, so repeated calls on one fitted model differ by that much too.
+`benchmark_arm_parity.py` does the same for the benchmark's `published_insample`
+arm, so the benchmark's "published" row is the notebook's model, not a
+re-implementation that might differ.
+
+**The CNN is checked at two levels.** (Before the port, the Keras version
+matched the notebook bit for bit; it is kept in `tests/parity/keras_reference.py`.)
+
+1. *Exact, same weights* (`test_torch_port.py`): with Keras weights copied into
+   the PyTorch model, the forward pass agrees to 2e-6, the L1/L2 penalty and
+   every gradient to float32 precision, and ten Adam steps without dropout give
+   the same losses, weights and BatchNorm statistics. The whole training loop
+   (`cnn.train` against Keras' `model.fit`, 12 epochs with validation and early
+   stopping, dropout and shuffling off so both see the same batches) gives the
+   same per-epoch loss and val_loss to 0.15% and the same predictions to 2e-3.
+   With dropout on, the spread of outputs over dropout masks matches Keras'
+   (same weights, 400 masks each; sd ratio 1.006). The early-stopping rule is
+   run against Keras' own callback on 50 random val_loss sequences and makes
+   the same stop and restore decisions.
+2. *Statistical, independent training* (`torch_vs_keras.py`): dropout masks,
+   shuffling order and float kernels differ between frameworks, so single runs
+   cannot match. Both were trained with seeds 0-9 on simulator data under the
+   notebook protocol (keras_tail validation, patience 15, up to 50 epochs;
+   8,010 EGF1 training rows, 40,720 EGF2 test rows). Full table:
+   [tests/parity/results/torch_vs_keras_sim.md](tests/parity/results/torch_vs_keras_sim.md).
+   - Training is indistinguishable: train loss, val_loss and accuracy at every
+     epoch, best val_loss (0.296 vs 0.303, p = 0.19), epochs run.
+   - So is what the network learns: the Spearman correlation of
+     p(class 2) - p(class 0) with N/C on the test replicate is 0.235 (Keras) vs
+     0.241 (PyTorch), p = 0.91, and seed-averaged predictions agree as well
+     across frameworks (r = 0.874) as within one (0.882 Keras, 0.899 PyTorch).
+   - Confidence in class 1 on the test replicate came out lower in PyTorch:
+     mean p(class 1) 0.86 vs 0.92, accuracy 0.871 vs 0.924, balanced accuracy
+     0.401 vs 0.380, log-loss 0.37 vs 0.28 (p 0.02-0.04, about one
+     within-framework sd; one effect seen through several metrics). Most of it
+     follows the epoch that early stopping restores, which is noisy (Spearman
+     0.66 with mean p(class 1), pooled); with that epoch in the model the
+     framework term is about half as large and not significant (p = 0.08).
+     Every component matches exactly or in distribution (level 1), so this is
+     read as chance; another 20 seeds would settle it.
+   - Seed alone moves test accuracy by about 5 points in either framework
+     (sd 0.044 Keras, 0.057 PyTorch), because early stopping watches
+     duplicates of ~20 class-2 rows (the keras_tail defect). That is larger
+     than any framework difference.
+   - PyTorch was ~20% slower per epoch on that 2-core machine (360 vs 428 s
+     per run).
+
+One finding from level 1 applies to the notebook's architecture itself: inputs
+are MinMax-scaled to [0, 1], so a first-layer filter whose three weights share
+a sign never leaves LeakyReLU's linear branch, and the BatchNorm right after it
+cancels that filter's bias. The bias has zero gradient; Adam normalises the
+float noise in it into full learning-rate steps, so these biases random-walk
+(in Keras too) without changing any output. Harmless, but those are dead
+parameters; putting BatchNorm before the activation, or dropping the conv bias,
+removes them.

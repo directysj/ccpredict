@@ -17,12 +17,13 @@ dependencies = [
     "joblib",
     "csaps",
     "imbalanced-learn",
-    "keras>=3",
-    "tensorflow",
+    "torch>=2.5",
 ]
 
 [project.optional-dependencies]
 test = ["pytest"]
+# Only for tests/parity (the notebook reference and the Keras-vs-PyTorch checks).
+parity = ["tensorflow", "keras>=3"]
 
 [project.scripts]
 ccpredict = "ccpredict.__main__:main"

@@ -83,6 +83,7 @@ class BenchmarkConfig:
         q = copy.deepcopy(self)
         q.pipeline.classifier.epochs, q.pipeline.classifier.patience = 3, 2
         q.pipeline.classifier.batch_size = 256
+        q.pipeline.net.epochs, q.pipeline.net.patience = 3, 2
         q.pipeline.regressor.n_estimators = 20
         q.pipeline.regressor.rfecv_step = 64
         q.n_boot, q.optimism_trees = 50, 10
@@ -231,6 +232,9 @@ def run_benchmark(cfg: BenchmarkConfig) -> dict:
     clf_cfg = copy.deepcopy(cfg.pipeline.classifier)
     if clf_cfg.seed is None:
         clf_cfg.seed = cfg.seed
+    net_cfg = copy.deepcopy(cfg.pipeline.net)
+    if net_cfg.seed is None:
+        net_cfg.seed = cfg.seed
     boundaries = clf_cfg.class_boundaries
     trim = ((cfg.pipeline.split.trim_bins, cfg.pipeline.split.trim_target_density,
              cfg.pipeline.split.trim_seed) if cfg.trim_training else None)
@@ -264,7 +268,8 @@ def run_benchmark(cfg: BenchmarkConfig) -> dict:
         diagnostics["splits"][split_name] = sd
         _write_json(os.path.join(cfg.output_dir, "diagnostics.json"), diagnostics)
 
-        ctx = SplitContext(split_name, train, tests, columns, clf_cfg, cfg.pipeline.regressor)
+        ctx = SplitContext(split_name, train, tests, columns, clf_cfg, cfg.pipeline.regressor,
+                           net_cfg)
         for arm_name in cfg.arms:
             arm = make_arm(arm_name)
             log.info("[%s] arm %s", split_name, arm_name)

@@ -10,6 +10,13 @@ import sys
 import numpy as np
 
 
+# Outputs of the CNN itself. Since stage 1 moved to PyTorch these cannot be
+# bitwise equal to the notebook's Keras run; they are compared statistically by
+# torch_vs_keras.py, and exactly (same weights) by test_torch_port.py.
+STAGE1_ARRAYS = {"y_pred_nn", "predicted_classes", "clf_metrics", "conf_matrix",
+                 "history_loss", "history_val_loss"}
+
+
 def main(ref_path: str, pkg_path: str) -> int:
     ref, pkg = np.load(ref_path), np.load(pkg_path)
     good = set(ref["indgood_models"].tolist())
@@ -21,6 +28,9 @@ def main(ref_path: str, pkg_path: str) -> int:
             ok = a.shape[0] == 0 and key not in pkg.files
             print(f"{key:<24}{str(a.shape):>16}  {'empty in notebook, absent in package (QC-failed FOV)' if ok else 'MISMATCH'}")
             failures += not ok
+            continue
+        if key in STAGE1_ARRAYS:
+            print(f"{key:<24}{str(a.shape):>16}  skipped: stage 1 is PyTorch (checked by torch_vs_keras.py)")
             continue
         if key not in pkg.files:
             print(f"{key:<24}{str(a.shape):>16}  MISSING in package")

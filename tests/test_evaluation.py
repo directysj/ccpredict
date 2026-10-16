@@ -1,9 +1,10 @@
 """Metrics, splits, diagnostics, simulator and a CPU-only benchmark smoke test.
 
-None of these need TensorFlow. Run with: pytest tests/
+None of these need TensorFlow (the CNN tests need PyTorch). Run with: pytest tests/
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 
@@ -127,7 +128,7 @@ def test_trajectory_overlap():
 
 # ---------------------------------------------------------------- grouped validation guard
 def test_grouped_holdout_requires_groups():
-    pytest.importorskip("keras")
+    pytest.importorskip("torch")
     from ccpredict.config import ClassifierConfig
     from ccpredict.models import StageOneClassifier
 
@@ -143,14 +144,252 @@ def test_classifier_runs_on_cpu_by_default():
     assert ClassifierConfig().device == "cpu"
 
 
-def test_configure_tensorflow():
-    tf = pytest.importorskip("tensorflow")
-    from ccpredict.compute import configure_tensorflow
+def test_select_device():
+    pytest.importorskip("torch")
+    from ccpredict.compute import select_device
 
     with pytest.raises(ValueError):
-        configure_tensorflow("tpu")
-    assert "CPU" in configure_tensorflow("cpu")
-    assert not tf.config.get_visible_devices("GPU")
+        select_device("tpu")
+    assert select_device("cpu").type == "cpu"
+    assert select_device("auto").type in ("cpu", "cuda", "mps")
+
+
+def test_old_tensorflow_thread_keys_still_load():
+    from ccpredict.config import ClassifierConfig, _from_dict
+
+    cfg = _from_dict(ClassifierConfig, {"tf_intra_op_threads": 4, "tf_inter_op_threads": 2})
+    assert cfg.num_threads == 4
+
+
+def _tiny_problem(seed=0, n=600, d=32):
+    rng = np.random.default_rng(seed)
+    y = rng.choice(3, n, p=[0.1, 0.8, 0.1])
+    X = rng.random((n, d)) + 0.3 * y[:, None]
+    return X, y
+
+
+def _quick_cfg(**kw):
+    from ccpredict.config import ClassifierConfig
+
+    return ClassifierConfig(epochs=3, patience=2, batch_size=64, verbose=0, seed=7, **kw)
+
+
+def test_cnn_regularisers_follow_the_notebook():
+    pytest.importorskip("torch")
+    from ccpredict.config import ClassifierConfig
+    from ccpredict.models import build_cnn_classifier
+
+    m = build_cnn_classifier(32, 3, ClassifierConfig())
+    kinds = [(type(layer).__name__, kind, lam) for layer, (kind, lam) in m._penalties]
+    assert kinds == [("Conv1d", "l2", 0.01), ("Conv1d", "l1", 0.02),
+                     ("Linear", "l2", 0.01), ("Linear", "l1", 0.02)]
+    manual = sum(lam * (layer.weight.abs().sum() if kind == "l1" else (layer.weight ** 2).sum())
+                 for layer, (kind, lam) in m._penalties)
+    assert abs(manual.item() - m.penalty().item()) < 1e-6
+
+
+@pytest.mark.parametrize("validation", ["keras_tail", "grouped_holdout"])
+def test_classifier_is_deterministic_with_a_seed(validation, tmp_path):
+    pytest.importorskip("torch")
+    from ccpredict.models import StageOneClassifier
+
+    X, y = _tiny_problem()
+    groups = np.arange(len(y)) // 10
+    a = StageOneClassifier(_quick_cfg(validation=validation), 3).fit(X, y, groups)
+    b = StageOneClassifier(_quick_cfg(validation=validation), 3).fit(X, y, groups)
+    pa, pb = a.predict_proba(X), b.predict_proba(X)
+    assert pa.dtype == np.float32 and pa.shape == (len(y), 3)
+    assert np.allclose(pa.sum(1), 1, atol=1e-5)
+    assert np.array_equal(pa, pb)
+    assert {"loss", "val_loss", "accuracy", "val_accuracy", "best_epoch"} <= set(a.history)
+
+    a.save(str(tmp_path))
+    c = StageOneClassifier.load(str(tmp_path), _quick_cfg(validation=validation))
+    assert np.array_equal(pa, c.predict_proba(X))
+
+
+# ---------------------------------------------------------------- one-stage neural regressor
+def _ratio_problem(seed=0, n=800, d=32):
+    """Positive, right-skewed target with a signal in the first few features."""
+    rng = np.random.default_rng(seed)
+    X = rng.random((n, d))
+    y = np.exp(0.3 * (X[:, :4].sum(1) - X[:, 4:8].sum(1)) + rng.normal(0, 0.15, n)) + 0.6
+    return X, y, np.arange(n) // 10
+
+
+def _net_cfg(**kw):
+    from ccpredict.config import NetConfig
+
+    return NetConfig(**{"epochs": 4, "patience": 2, "batch_size": 64, "verbose": 0, "seed": 5, **kw})
+
+
+def test_net_config_defaults_depart_from_the_notebook_deliberately():
+    from ccpredict.config import ClassifierConfig, NetConfig
+
+    cfg, notebook = NetConfig(), ClassifierConfig()
+    assert cfg.encoder == "mlp"                       # no convolution along the latent index
+    assert cfg.norm_position == "before_activation" and cfg.conv_bias is False
+    assert cfg.validation == "grouped_holdout"        # not the oversampled tail
+    assert cfg.seed is not None                       # the notebook set none
+    # Much lighter than the notebook's l2 0.01 / l1 0.02.
+    assert max(lam for _, lam in cfg.regularizers) < max(lam for _, lam in notebook.regularizers) / 10
+
+
+def test_pipeline_config_without_a_net_section_still_loads():
+    from ccpredict.config import NetConfig, PipelineConfig
+
+    cfg = PipelineConfig.from_dict({"fovs": ["A2_1"], "classifier": {"epochs": 2}})
+    assert cfg.net == NetConfig() and cfg.classifier.epochs == 2
+
+
+def test_mlp_encoder_has_no_convolutions():
+    pytest.importorskip("torch")
+    from ccpredict.models import build_net
+
+    mlp = build_net(32, 1, _net_cfg())
+    assert len(mlp.convs) == 0 and len(mlp.norms) == 0
+    assert mlp.denses[0].weight.shape[1] == 32          # features go straight to the dense stack
+    conv = build_net(32, 1, _net_cfg(encoder="conv"))
+    assert len(conv.convs) == 2 and all(c.bias is None for c in conv.convs)
+
+
+def test_conv_bias_is_dead_when_batchnorm_comes_first():
+    """Why conv_bias=False goes with norm_position='before_activation': BatchNorm
+    subtracts the batch mean, so a per-channel constant added before it cannot
+    change any output. With the notebook's order the activation sits in between,
+    so the bias does something (except for filters that never leave the linear
+    branch -- see tests/parity/test_torch_port.py)."""
+    torch = pytest.importorskip("torch")
+    from ccpredict.models import build_net
+
+    X = torch.rand(64, 32)
+    ratios = {}
+    for position in ("before_activation", "after_activation"):
+        net = build_net(32, 1, _net_cfg(encoder="conv", norm_position=position, conv_bias=True))
+        net.train()
+        net(X).square().mean().backward()
+        conv = net.convs[0]
+        # Against the weight gradients of the same layer, so this is scale-free.
+        ratios[position] = (float(conv.bias.grad.abs().max())
+                            / float(conv.weight.grad.abs().max()))
+    assert ratios["before_activation"] < 1e-4        # float noise around an exact zero
+    assert ratios["after_activation"] > 1e-2
+
+
+def test_histogram_head_predicts_the_expected_label():
+    torch = pytest.importorskip("torch")
+    from ccpredict.cnn import HistogramObjective
+
+    y = np.concatenate([np.full(100, 1.0), np.full(100, 2.0), np.full(100, 3.0)])
+    obj = HistogramObjective.from_labels(y, n_bins=3)
+    assert obj.out_features == 3
+    assert np.allclose(obj.centers, [1.0, 2.0, 3.0])
+    assert np.array_equal(obj.encode(np.array([1.0, 2.0, 3.0])), [0, 1, 2])
+    # A confident logit returns that bin's mean label; a flat one returns the overall mean.
+    confident = torch.tensor([[20.0, 0.0, 0.0], [0.0, 0.0, 20.0]])
+    assert np.allclose(obj.predict(confident), [1.0, 3.0], atol=1e-6)
+    assert np.allclose(obj.predict(torch.zeros(1, 3)), [2.0], atol=1e-6)
+
+
+def test_log_target_round_trips_and_rejects_non_positive_labels():
+    pytest.importorskip("torch")
+    from ccpredict.cnn import RegressionObjective
+
+    obj = RegressionObjective("log")
+    y = np.array([0.5, 1.0, 2.5])
+    assert np.allclose(obj.decode(obj.encode(y)), y, atol=1e-6)
+    with pytest.raises(ValueError):
+        obj.encode(np.array([1.0, 0.0]))
+
+
+def test_inverse_density_weights_favour_rare_labels():
+    pytest.importorskip("torch")
+    from ccpredict.cnn import inverse_density_weights
+
+    y = np.concatenate([np.random.default_rng(0).normal(1.5, 0.05, 2000), [3.0, 3.1]])
+    w = inverse_density_weights(y, clip=10.0)
+    assert w.max() <= 10.0                            # nothing counts for more than 10 average rows
+    assert w[-1] == 10.0 and w[-2] == 10.0            # the two rare high ratios are the ones clipped
+    assert w[:2000].mean() < 1.0                      # the bulk is held below average weight
+    # Within the bulk, rarer labels still get more weight than the mode.
+    mode = np.argmin(np.abs(y[:2000] - 1.5))
+    assert w[np.argmax(np.abs(y[:2000] - 1.5))] > w[mode]
+
+
+@pytest.mark.parametrize("over", [{}, {"target_transform": "log"}, {"loss": "huber"},
+                                  {"head": "histogram", "n_bins": 8},
+                                  {"label_weighting": "inverse_density"},
+                                  {"encoder": "conv"}])
+def test_direct_regressor_is_deterministic_and_round_trips(over, tmp_path):
+    pytest.importorskip("torch")
+    from ccpredict.models import DirectRegressor
+
+    X, y, groups = _ratio_problem()
+    a = DirectRegressor(_net_cfg(**over)).fit(X, y, groups)
+    b = DirectRegressor(_net_cfg(**over)).fit(X, y, groups)
+    pa = a.predict(X)
+    assert pa.shape == (len(y),)
+    assert np.array_equal(pa, b.predict(X))
+    assert np.all(np.isfinite(pa)) and pa.min() > 0
+    assert {"loss", "val_loss", "best_epoch"} <= set(a.history)
+
+    a.save(str(tmp_path))
+    c = DirectRegressor.load(str(tmp_path))
+    assert np.array_equal(pa, c.predict(X))
+    assert c.cfg == a.cfg
+
+
+def test_direct_regressor_starts_at_the_training_mean():
+    """A regression head's output bias is the mean target, so an untrained net
+    predicts the constant baseline instead of drifting towards it."""
+    pytest.importorskip("torch")
+    from ccpredict.models import DirectRegressor
+
+    X, y, groups = _ratio_problem()
+    m = DirectRegressor(_net_cfg(epochs=1, dropout=0.0)).fit(X, y, groups)
+    assert abs(float(m.model.out.bias.item()) - y.mean()) < 0.35
+
+
+def test_direct_regressor_beats_the_constant_baseline():
+    pytest.importorskip("torch")
+    from ccpredict.models import DirectRegressor
+
+    X, y, groups = _ratio_problem()
+    held = np.arange(len(y)) % 4 == 0
+    m = DirectRegressor(_net_cfg(epochs=40, patience=10)).fit(X[~held], y[~held], groups[~held])
+    pred = m.predict(X[held])
+    mse = float(np.mean((pred - y[held]) ** 2))
+    constant = float(np.mean((y[~held].mean() - y[held]) ** 2))
+    assert mse < 0.7 * constant
+    assert np.corrcoef(pred, y[held])[0, 1] > 0.5
+
+
+def test_grouped_validation_requires_groups_but_random_rows_does_not():
+    pytest.importorskip("torch")
+    from ccpredict.models import DirectRegressor
+
+    X, y, _ = _ratio_problem(n=200)
+    with pytest.raises(ValueError, match="groups"):
+        DirectRegressor(_net_cfg()).fit(X, y)
+    DirectRegressor(_net_cfg(validation="random_rows")).fit(X, y)
+
+
+def test_neural_arms_differ_only_by_their_overrides():
+    from ccpredict.arms import NEURAL_ARMS, SplitContext, make_arm
+    from ccpredict.config import ClassifierConfig, NetConfig, RegressorConfig
+
+    ctx = SplitContext("s", None, {}, lambda f: None, ClassifierConfig(), RegressorConfig(),
+                       NetConfig())
+    base = NetConfig()
+    for name, overrides in NEURAL_ARMS.items():
+        cfg = make_arm(name).cfg(ctx)
+        changed = {f.name for f in dataclasses.fields(cfg)
+                   if getattr(cfg, f.name) != getattr(base, f.name)}
+        assert changed == set(overrides), name
+    with pytest.raises(KeyError):
+        from ccpredict.arms import NeuralArm
+
+        NeuralArm("bogus", no_such_field=1).cfg(ctx)
 
 
 def test_rfecv_runs_folds_serially_and_trees_in_parallel():
@@ -203,7 +442,7 @@ def test_simulator_reporter_file_aligned(tiny_sim):
     assert np.allclose(rep.n2c[k], s.nc_obs[t][ok])
 
 
-# ---------------------------------------------------------------- benchmark smoke test (no TF)
+# ---------------------------------------------------------------- benchmark smoke test
 def test_benchmark_runs_cpu_arms(tiny_sim, tmp_path):
     from ccpredict.benchmark import run_benchmark
 
