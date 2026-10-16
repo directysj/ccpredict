@@ -1,0 +1,10 @@
+# local runs: simulated data, benchmark outputs, caches
+runs/
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+# editors / OS
+.idea/
+.DS_Store
