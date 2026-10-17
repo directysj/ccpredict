@@ -134,7 +134,9 @@ def regression_report(y_true: np.ndarray, y_pred: np.ndarray, groups: Optional[n
     with np.errstate(all="ignore"):
         out = regression_metrics(y_true, y_pred)
         lt, lp = np.log(y_true), np.log(np.clip(y_pred, 1e-6, None))
-        var_p = np.var(y_pred)
+        # ddof=1 to match np.cov below, which uses it; mixing the two biased the
+        # slope by n/(n-1).
+        var_p = np.var(y_pred, ddof=1)
         out.update({
             "n": int(y_true.size),
             "spearman": float("nan") if constant else float(spearmanr(y_true, y_pred)[0]),

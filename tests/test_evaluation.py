@@ -230,7 +230,6 @@ def test_net_config_defaults_depart_from_the_notebook_deliberately():
     assert cfg.encoder == "mlp"                       # no convolution along the latent index
     assert cfg.norm_position == "before_activation" and cfg.conv_bias is False
     assert cfg.validation == "grouped_holdout"        # not the oversampled tail
-    assert cfg.seed is not None                       # the notebook set none
     # Much lighter than the notebook's l2 0.01 / l1 0.02.
     assert max(lam for _, lam in cfg.regularizers) < max(lam for _, lam in notebook.regularizers) / 10
 
@@ -240,6 +239,75 @@ def test_pipeline_config_without_a_net_section_still_loads():
 
     cfg = PipelineConfig.from_dict({"fovs": ["A2_1"], "classifier": {"epochs": 2}})
     assert cfg.net == NetConfig() and cfg.classifier.epochs == 2
+
+
+def test_benchmark_seed_reaches_the_nn_arms():
+    """NetConfig.seed defaults to None so a run's seed is not silently ignored
+    (it used to default to 0, which no BenchmarkConfig.seed could override)."""
+    from ccpredict.benchmark import BenchmarkConfig
+    from ccpredict.config import NetConfig
+
+    assert NetConfig().seed is None
+    cfg = BenchmarkConfig(seed=7)
+    net = cfg.pipeline.net
+    assert (net.seed if net.seed is not None else cfg.seed) == 7
+    # An explicit seed still wins over the run's.
+    cfg.pipeline.net.seed = 3
+    assert (cfg.pipeline.net.seed if cfg.pipeline.net.seed is not None else cfg.seed) == 3
+
+
+def test_metrics_never_ask_the_device_for_float64():
+    """Apple's MPS backend has no float64, so a `.double()` anywhere in the
+    training path kills every run with device='auto'/'gpu' on a Mac. Metrics are
+    computed from numpy on the host instead; this forbids Tensor.double outright
+    so the regression is caught on a CPU-only machine too."""
+    torch = pytest.importorskip("torch")
+    from ccpredict.models import DirectRegressor
+
+    X, y, groups = _ratio_problem(n=200)
+    original = torch.Tensor.double
+
+    def refuse(self, *a, **k):
+        raise AssertionError("Tensor.double() in the training path: MPS has no float64")
+
+    torch.Tensor.double = refuse
+    try:
+        m = DirectRegressor(_net_cfg(head="histogram", n_bins=4)).fit(X, y, groups)
+        assert np.all(np.isfinite(m.predict(X)))
+        m = DirectRegressor(_net_cfg()).fit(X, y, groups)
+        assert np.all(np.isfinite(m.predict(X)))
+        assert all(np.isfinite(m.history["pearson_r"]))
+    finally:
+        torch.Tensor.double = original
+
+
+@pytest.mark.parametrize("device", ["mps", "cuda"])
+def test_fit_runs_on_an_accelerator_when_present(device):
+    """The real check for the above, on whatever accelerator this machine has."""
+    torch = pytest.importorskip("torch")
+    available = {"mps": getattr(torch.backends, "mps", None) is not None
+                 and torch.backends.mps.is_available(),
+                 "cuda": torch.cuda.is_available()}
+    if not available[device]:
+        pytest.skip(f"no {device} on this machine")
+    from ccpredict.models import DirectRegressor
+
+    X, y, groups = _ratio_problem(n=300)
+    for over in ({}, {"head": "histogram", "n_bins": 8}, {"encoder": "conv"}):
+        m = DirectRegressor(_net_cfg(device="auto", **over)).fit(X, y, groups)
+        assert m.device.type == device
+        assert np.all(np.isfinite(m.predict(X)))
+
+
+def test_no_regularisers_means_no_penalty():
+    """regularizers=() is the natural way to say 'no penalty'; it used to raise
+    ZeroDivisionError from the k % len(regs) rule."""
+    pytest.importorskip("torch")
+    from ccpredict.models import build_net
+
+    net = build_net(32, 1, _net_cfg(regularizers=()))
+    assert net._penalties == []
+    assert net.penalty().item() == 0.0
 
 
 def test_mlp_encoder_has_no_convolutions():
@@ -274,6 +342,28 @@ def test_conv_bias_is_dead_when_batchnorm_comes_first():
                             / float(conv.weight.grad.abs().max()))
     assert ratios["before_activation"] < 1e-4        # float noise around an exact zero
     assert ratios["after_activation"] > 1e-2
+
+
+def test_training_rejects_zero_epochs():
+    """It used to run no epochs and then crash in load_state_dict(None)."""
+    torch = pytest.importorskip("torch")
+    from ccpredict.cnn import FeedForwardNet, train
+
+    with pytest.raises(ValueError, match="epochs"):
+        train(FeedForwardNet(8, 3, encoder="mlp"), np.zeros((4, 8)), np.zeros(4, int),
+              np.zeros((4, 8)), np.zeros(4, int), epochs=0, batch_size=2, learning_rate=1e-3,
+              patience=1, min_delta=0.0, device=torch.device("cpu"),
+              rng=np.random.default_rng(0), verbose=0)
+
+
+def test_calibration_slope_is_one_for_perfect_predictions():
+    """Slope = cov(y, p) / var(p); both parts need the same ddof."""
+    rng = np.random.default_rng(0)
+    y = rng.normal(1.5, 0.3, 50)
+    assert abs(regression_report(y, y.copy(), n_boot=5)["calibration_slope"] - 1.0) < 1e-12
+    # Halving the spread of the predictions must double the slope, exactly.
+    p = y.mean() + 0.5 * (y - y.mean())
+    assert abs(regression_report(y, p, n_boot=5)["calibration_slope"] - 2.0) < 1e-12
 
 
 def test_histogram_head_predicts_the_expected_label():

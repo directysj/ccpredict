@@ -359,6 +359,8 @@ def write_report(cfg: BenchmarkConfig, rows: List[dict], diagnostics: dict) -> s
              f"Scheme: `{cfg.scheme}`; training labels trimmed: {cfg.trim_training}; "
              f"snippet length: {cfg.pipeline.features.trajl}; label frame: `{cfg.pipeline.features.label_frame}`; "
              f"CNN device: `{cfg.pipeline.classifier.device}`, batch {cfg.pipeline.classifier.batch_size}; "
+             f"nn_* device: `{cfg.pipeline.net.device}`, batch {cfg.pipeline.net.batch_size}, "
+             f"seed {cfg.pipeline.net.seed if cfg.pipeline.net.seed is not None else cfg.seed}; "
              f"RFECV step: {cfg.pipeline.regressor.rfecv_step}.",
              "", "R and MSE are on raw N/C (the paper's metrics). The 95% interval resamples whole "
              "trajectories. `*_insample` arms are fitted on the rows they are scored on.", ""]

@@ -105,7 +105,7 @@ class ClassifierConfig:
     """Stage 1: CNN+DNN classifier of binned N/C ratio (In [25], [27], [32]-[37]).
 
     Implemented in PyTorch with the notebook's Keras defaults reproduced
-    (see models.py): Glorot init, BatchNorm momentum 0.99 / eps 1e-3, LeakyReLU
+    (see cnn.py): Glorot init, BatchNorm momentum 0.99 / eps 1e-3, LeakyReLU
     slope 0.3, L1/L2 penalties added to the loss, Keras-style Adam (eps 1e-7).
     """
 
@@ -243,7 +243,10 @@ class NetConfig:
     validation_seed: int = 42
     patience: int = 20
     min_delta: float = 1e-4
-    seed: Optional[int] = 0
+    # None = unseeded, as ClassifierConfig.seed is. The benchmark fills it with
+    # BenchmarkConfig.seed, so a run's seed reaches these arms too; set it here
+    # to pin one arm independently of the run.
+    seed: Optional[int] = None
     device: Literal["cpu", "gpu", "auto"] = "cpu"
     num_threads: Optional[int] = None
     verbose: int = 1

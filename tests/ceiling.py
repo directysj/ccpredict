@@ -70,6 +70,7 @@ def main(argv=None) -> None:
     ap.add_argument("simulation", help="simulation.json written next to a simulated dataset")
     ap.add_argument("--trees", type=int, default=100)
     ap.add_argument("--n-jobs", type=int, default=-1, help="forest threads (1 to leave cores free)")
+    ap.add_argument("--seed", type=int, default=0, help="seed for the MLP (the forest has its own)")
     args = ap.parse_args(argv)
 
     from ccpredict.config import RegressorConfig, _from_dict
@@ -96,8 +97,12 @@ def main(argv=None) -> None:
 
     from ccpredict.config import NetConfig
     from ccpredict.models import DirectRegressor
+    from ccpredict.preprocessing import trajectory_groups
     reg = RegressorConfig()
-    g_train = np.concatenate([groups[f] + 1000 * i for i, f in enumerate(train)])
+    # Trajectory ids restart in every FOV, so make them unique the same way the
+    # package does (a fixed 1000-per-FOV offset collides past 1000 trajectories).
+    g_train = np.concatenate([trajectory_groups(np.full(groups[f].size, i), groups[f])
+                              for i, f in enumerate(train)])
 
     def fit_forest(X, y):
         model = RandomForestRegressor(
@@ -112,7 +117,8 @@ def main(argv=None) -> None:
         from sklearn.preprocessing import MinMaxScaler
 
         scaler = MinMaxScaler().fit(X)
-        model = DirectRegressor(NetConfig(verbose=0)).fit(scaler.transform(X), y, g_train)
+        model = DirectRegressor(NetConfig(verbose=0, seed=args.seed)).fit(
+            scaler.transform(X), y, g_train)
         return lambda Z: model.predict(scaler.transform(Z))
 
     print(f"\ntrain {train} ({y_train.size} rows) -> test {test}")

@@ -112,8 +112,10 @@ class FeedForwardNet(nn.Module):
         self.drop = nn.Dropout(dropout)
         # As in the notebook: regulariser k % len(regs) for the k-th conv, and again
         # from the start for the dense layers (conv1 l2, conv2 l1, dense1 l2, dense2 l1).
+        # An empty tuple means no penalty at all.
         regs = list(regularizers)
-        self._penalties = ([(c, regs[i % len(regs)]) for i, c in enumerate(self.convs)]
+        self._penalties = ([] if not regs else
+                           [(c, regs[i % len(regs)]) for i, c in enumerate(self.convs)]
                            + [(d, regs[i % len(regs)]) for i, d in enumerate(self.denses)])
         for m in list(self.convs) + list(self.denses) + [self.out]:
             nn.init.xavier_uniform_(m.weight)
@@ -154,6 +156,14 @@ class Objective:
     added to the weight penalty, ``predict`` maps outputs back to the quantity
     being reported, and ``metric`` is logged per epoch (early stopping always
     watches the loss, never the metric).
+
+    Where each one runs matters, because Apple's MPS backend has no float64:
+
+      loss     on the device, in the model's dtype (float32)
+      predict  a tensor already moved to the CPU
+      metric   numpy arrays, so correlations can use float64 exactly
+
+    Nothing here may ask a non-CPU tensor for float64.
     """
 
     out_features: int = 1
@@ -170,7 +180,7 @@ class Objective:
     def predict(self, out: torch.Tensor) -> np.ndarray:
         raise NotImplementedError
 
-    def metric(self, out: torch.Tensor, t: torch.Tensor) -> float:
+    def metric(self, out: np.ndarray, t: np.ndarray) -> float:
         raise NotImplementedError
 
     @staticmethod
@@ -198,10 +208,10 @@ class ClassificationObjective(Objective):
         return self._reduce(F.cross_entropy(out, t, reduction="none"), weights, reduction)
 
     def predict(self, out):
-        return torch.softmax(out, dim=1).cpu().numpy()
+        return torch.softmax(out, dim=1).numpy()
 
     def metric(self, out, t):
-        return float((out.argmax(1) == t).double().mean())
+        return float(np.mean(out.argmax(1) == t))
 
 
 class RegressionObjective(Objective):
@@ -241,7 +251,7 @@ class RegressionObjective(Objective):
         return self._reduce(per_row, weights, reduction)
 
     def predict(self, out):
-        return self.decode(out[:, 0].cpu().numpy().astype(np.float64))
+        return self.decode(out[:, 0].numpy().astype(np.float64))
 
     def metric(self, out, t):
         return _pearson(out[:, 0], t)
@@ -272,7 +282,12 @@ class HistogramObjective(Objective):
         y = np.asarray(y, dtype=np.float64)
         edges = np.unique(np.quantile(y, np.linspace(0, 1, n_bins + 1)[1:-1]))
         index = np.digitize(y, edges)
-        centers = np.array([y[index == k].mean() if np.any(index == k) else 0.0
+        # Equal-count bins, so a bin is empty only for a degenerate label
+        # distribution; fall back to the middle of the bin, never 0.
+        padded = np.concatenate([[2 * edges[0] - edges[-1]] if edges.size else [y.min() - 1],
+                                 edges, [2 * edges[-1] - edges[0]] if edges.size else [y.max() + 1]])
+        centers = np.array([y[index == k].mean() if np.any(index == k)
+                            else 0.5 * (padded[k] + padded[k + 1])
                             for k in range(edges.size + 1)])
         return cls(edges, centers)
 
@@ -292,17 +307,26 @@ class HistogramObjective(Objective):
     def expectation(self, out: torch.Tensor) -> torch.Tensor:
         return torch.softmax(out, dim=1) @ self._centers(out.device)
 
+    def expectation_np(self, out: np.ndarray) -> np.ndarray:
+        """The same expectation in numpy (float64), for the metric."""
+        z = np.asarray(out, dtype=np.float64)
+        z = np.exp(z - z.max(axis=1, keepdims=True))
+        return (z / z.sum(axis=1, keepdims=True)) @ self.centers
+
     def predict(self, out):
-        return self.expectation(out).cpu().numpy().astype(np.float64)
+        return self.expectation(out).numpy().astype(np.float64)
 
     def metric(self, out, t):
-        return _pearson(self.expectation(out), self._centers(out.device)[t])
+        # The bin centre stands in for the label, which is all the encoded target keeps.
+        return _pearson(self.expectation_np(out), self.centers[t])
 
 
-def _pearson(a: torch.Tensor, b: torch.Tensor) -> float:
-    a, b = a.double().flatten(), b.double().flatten()
+def _pearson(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson R in float64 on the host (MPS has no float64; see Objective)."""
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
     a, b = a - a.mean(), b - b.mean()
-    denom = a.norm() * b.norm()
+    denom = np.sqrt(a @ a) * np.sqrt(b @ b)
     return float(a @ b / denom) if denom > 0 else 0.0
 
 
@@ -375,19 +399,21 @@ class EarlyStopping:
         return self.wait >= self.patience and epoch > 0
 
 
-def _evaluate(model, X: torch.Tensor, y: torch.Tensor, batch_size: int,
+def _evaluate(model, X: torch.Tensor, y: torch.Tensor, y_np: np.ndarray, batch_size: int,
               obj: Objective) -> Tuple[float, float]:
-    """Keras-style validation: mean loss over all rows + penalty, and the metric."""
+    """Keras-style validation: mean loss over all rows + penalty, and the metric.
+
+    The loss runs on the device; the metric gets the outputs as numpy on the
+    host, because it needs float64 and MPS has none."""
     model.eval()
     loss_sum, outs = 0.0, []
     with torch.no_grad():
         for s in range(0, X.shape[0], batch_size):
             out = model(X[s:s + batch_size])
             loss_sum += obj.loss(out, y[s:s + batch_size], reduction="sum").item()
-            outs.append(out)
+            outs.append(out.cpu().numpy())
         pen = model.penalty().item()
-        metric = obj.metric(torch.cat(outs), y)
-    return loss_sum / X.shape[0] + pen, metric
+    return loss_sum / X.shape[0] + pen, obj.metric(np.concatenate(outs), y_np)
 
 
 def train(model: FeedForwardNet, X_tr: np.ndarray, y_tr: np.ndarray, X_val: np.ndarray,
@@ -404,13 +430,19 @@ def train(model: FeedForwardNet, X_tr: np.ndarray, y_tr: np.ndarray, X_val: np.n
 
     shuffle=False (rows in order every epoch) exists only so the whole loop can
     be compared step for step with Keras' fit(shuffle=False) in tests/parity."""
+    if epochs < 1:
+        raise ValueError(f"epochs must be at least 1, got {epochs}")
     obj = objective or ClassificationObjective(model.out.out_features)
     model.to(device)
-    Xt = torch.as_tensor(X_tr, dtype=torch.float32, device=device)
-    yt = torch.as_tensor(y_tr, dtype=obj.target_dtype, device=device)
-    Xv = torch.as_tensor(X_val, dtype=torch.float32, device=device)
-    yv = torch.as_tensor(y_val, dtype=obj.target_dtype, device=device)
-    wt = None if weights is None else torch.as_tensor(weights, dtype=torch.float32, device=device)
+    # Cast on the host first: MPS has no float64, so a float64 array must never
+    # be handed to the device, not even for it to convert.
+    y_tr_np, y_val_np = np.asarray(y_tr), np.asarray(y_val)
+    Xt = torch.as_tensor(np.asarray(X_tr, dtype=np.float32), device=device)
+    yt = torch.as_tensor(y_tr_np, dtype=obj.target_dtype, device=device)
+    Xv = torch.as_tensor(np.asarray(X_val, dtype=np.float32), device=device)
+    yv = torch.as_tensor(y_val_np, dtype=obj.target_dtype, device=device)
+    wt = (None if weights is None
+          else torch.as_tensor(np.asarray(weights, dtype=np.float32), device=device))
     opt = KerasAdam(model.parameters(), lr=learning_rate)
     m = obj.metric_name
     history: Dict[str, List[float]] = {"loss": [], m: [], "val_loss": [], f"val_{m}": []}
@@ -421,7 +453,8 @@ def train(model: FeedForwardNet, X_tr: np.ndarray, y_tr: np.ndarray, X_val: np.n
     for epoch in range(epochs):
         t0 = time.time()
         model.train()
-        order = torch.as_tensor(rng.permutation(n) if shuffle else np.arange(n), device=device)
+        order_np = rng.permutation(n) if shuffle else np.arange(n)
+        order = torch.as_tensor(order_np, device=device)
         loss_sum, outs = 0.0, []
         for b in range(n_batches):
             idx = order[b * batch_size:(b + 1) * batch_size]
@@ -431,10 +464,9 @@ def train(model: FeedForwardNet, X_tr: np.ndarray, y_tr: np.ndarray, X_val: np.n
             loss.backward()
             opt.step()
             loss_sum += loss.item() * idx.numel()
-            outs.append(out.detach())
-        with torch.no_grad():
-            train_metric = obj.metric(torch.cat(outs), yt[order])
-        val_loss, val_metric = _evaluate(model, Xv, yv, max(batch_size, 1024), obj)
+            outs.append(out.detach().cpu().numpy())
+        train_metric = obj.metric(np.concatenate(outs), y_tr_np[order_np])
+        val_loss, val_metric = _evaluate(model, Xv, yv, y_val_np, max(batch_size, 1024), obj)
         for k, v in (("loss", loss_sum / n), (m, train_metric), ("val_loss", val_loss),
                      (f"val_{m}", val_metric)):
             history[k].append(float(v))
@@ -460,8 +492,8 @@ def predict(model: FeedForwardNet, X: np.ndarray, device, objective: Optional[Ob
     out = []
     with torch.no_grad():
         for s in range(0, X.shape[0], batch_size):
-            xb = torch.as_tensor(X[s:s + batch_size], dtype=torch.float32, device=device)
-            out.append(obj.predict(model(xb)))
+            xb = torch.as_tensor(np.asarray(X[s:s + batch_size], dtype=np.float32), device=device)
+            out.append(obj.predict(model(xb).cpu()))      # Objective.predict expects a CPU tensor
     if out:
         return np.concatenate(out)
     return np.zeros((0, obj.out_features) if obj.out_features > 1 else (0,))

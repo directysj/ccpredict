@@ -1,4 +1,4 @@
-"""Choose where PyTorch runs (only the stage-1 CNN uses PyTorch)."""
+"""Choose where PyTorch runs (the stage-1 classifier and the one-stage nn_* regressors)."""
 from __future__ import annotations
 
 import logging
