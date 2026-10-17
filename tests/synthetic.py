@@ -35,7 +35,10 @@ class Trajectory:
     def __init__(self, **attrs):
         self.__dict__.update(attrs)
 
-    def get_unique_trajectories(self):
+    def get_unique_trajectories(self, cell_inds=None, verbose=False, extra_depth=None):
+        # Signature matches the real jcTrajectory_CP (see data.extract_trajectories).
+        if extra_depth:
+            raise ValueError("the fixture builds disjoint tracks; extra_depth>0 is not modelled")
         self.trajectories = [np.asarray(t).copy() for t in self._tracks]
 '''
 

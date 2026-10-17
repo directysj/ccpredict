@@ -62,7 +62,8 @@ def main(argv=None) -> None:
             clf = copy.deepcopy(cfg.pipeline.classifier)
             clf.seed = seed
             # A fresh context per run: the cache holds the scaler, not the models.
-            ctx = SplitContext(split_name, train, tests, columns, clf, cfg.pipeline.regressor, net)
+            ctx = SplitContext(split_name, train, tests, columns, clf, cfg.pipeline.regressor,
+                               net, trajl=cfg.pipeline.features.trajl)
             t0 = time.time()
             out = make_arm(name).run(ctx)
             for fov, res in out.items():

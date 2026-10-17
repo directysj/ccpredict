@@ -303,11 +303,14 @@ def test_fit_runs_on_an_accelerator_when_present(device):
 def _sequence_net(encoder, steps=8, nf=16, out=3, **kw):
     from ccpredict.cnn import FeedForwardNet
 
-    return FeedForwardNet(steps * nf, out, encoder=encoder, steps=steps, dropout=0.0,
-                          snapshot_hidden=(8,), temporal_filters=(8, 8), **kw)
+    # Every sequence encoder is given the same per-step width (8), so a shape
+    # assertion holds for all of them and comparisons are of the encoder alone.
+    kw = {"snapshot_hidden": (8,), "temporal_filters": (8, 8), "transformer_dim": 8,
+          "transformer_heads": 2, "transformer_layers": 1, "transformer_ff": 16, **kw}
+    return FeedForwardNet(steps * nf, out, encoder=encoder, steps=steps, dropout=0.0, **kw)
 
 
-@pytest.mark.parametrize("encoder", ["snapshot_shared", "temporal_conv"])
+@pytest.mark.parametrize("encoder", ["snapshot_shared", "temporal_conv", "transformer"])
 def test_sequence_encoders_read_the_input_as_snapshots(encoder):
     """The row is [snapshot 0 features | snapshot 1 features | ...]; these encoders
     must recover that (steps, nf) block layout, which is what the notebook's
@@ -385,6 +388,7 @@ def test_sequence_encoders_are_far_smaller_than_the_flat_conv():
     assert flat_conv > 4_000_000
     assert count(encoder="snapshot_shared") < flat_conv / 20
     assert count(encoder="temporal_conv") < flat_conv / 20
+    assert count(encoder="transformer") < flat_conv / 20
 
 
 def test_sequence_encoder_rejects_an_input_that_is_not_whole_snapshots():
@@ -393,8 +397,142 @@ def test_sequence_encoder_rejects_an_input_that_is_not_whole_snapshots():
 
     with pytest.raises(ValueError, match="do not divide"):
         FeedForwardNet(100, 3, encoder="temporal_conv", steps=8)
-    with pytest.raises(ValueError, match="encoder"):
-        FeedForwardNet(64, 3, encoder="transformer", steps=8)
+    with pytest.raises(ValueError, match="encoder must be one of"):
+        FeedForwardNet(64, 3, encoder="no_such_encoder", steps=8)
+
+
+# ------------------------------------------------------- transformer encoder
+def test_transformer_attends_across_the_snapshots_of_the_snippet():
+    """The point of the encoder, and the thing snapshot_shared cannot do:
+    with pool="last" the read-out token must still respond to a change in an
+    *earlier* snapshot, because attention let it read that snapshot."""
+    torch = pytest.importorskip("torch")
+
+    x = torch.rand(3, 8 * 16)
+    disturbed = x.clone()
+    disturbed[:, :16] += 5.0                               # snapshot 0 only
+
+    attn = _sequence_net("transformer", pool="last").eval()
+    shared = _sequence_net("snapshot_shared", pool="last").eval()
+    with torch.no_grad():
+        assert not torch.allclose(attn(x), attn(disturbed), atol=1e-4)
+        assert torch.allclose(shared(x), shared(disturbed), atol=1e-6)
+
+
+def test_transformer_mixes_along_time_and_not_along_features():
+    """With the positional embedding zeroed the stack is permutation-equivariant:
+    permuting the snapshots permutes the per-step outputs and nothing else. That
+    pins the attention to axis 1 (snapshots), which is the axis asked for."""
+    torch = pytest.importorskip("torch")
+
+    net = _sequence_net("transformer", steps=4, nf=6).eval()
+    with torch.no_grad():
+        net.positions.zero_()
+        snapshots = torch.rand(4, 6)
+        a = net._per_step(snapshots.reshape(1, -1))[0]
+        rolled = net._per_step(torch.roll(snapshots, 1, dims=0).reshape(1, -1))[0]
+    assert torch.allclose(a, torch.roll(rolled, -1, dims=0), atol=1e-5)
+    # ... and the learned positions are what break that symmetry, so a trained
+    # net is order-aware rather than a bag of snapshots.
+    net2 = _sequence_net("transformer", steps=4, nf=6).eval()
+    with torch.no_grad():
+        b = net2._per_step(snapshots.reshape(1, -1))[0]
+        b_rolled = net2._per_step(torch.roll(snapshots, 1, dims=0).reshape(1, -1))[0]
+    assert not torch.allclose(b, torch.roll(b_rolled, -1, dims=0), atol=1e-5)
+
+
+def test_transformer_rejects_a_head_count_that_does_not_divide_the_width():
+    pytest.importorskip("torch")
+    from ccpredict.cnn import FeedForwardNet
+
+    with pytest.raises(ValueError, match="must divide by"):
+        FeedForwardNet(8 * 16, 3, encoder="transformer", steps=8,
+                       transformer_dim=64, transformer_heads=6)
+    with pytest.raises(ValueError, match="transformer_layers"):
+        FeedForwardNet(8 * 16, 3, encoder="transformer", steps=8, transformer_layers=0)
+
+
+def test_split_context_refuses_an_unset_trajl():
+    """trajl=1 on trajl=8 features trains a different model and still reports a
+    number: the sequence encoders see one snapshot of nf*trajl features and a
+    transformer gets a single token, so nothing attends to anything. It must be
+    impossible to leave it unsaid (tests/seed_spread.py did, for one sweep)."""
+    from ccpredict.arms import SplitContext
+    from ccpredict.config import ClassifierConfig, NetConfig, RegressorConfig
+
+    args = ("s", None, {}, lambda f: None, ClassifierConfig(), RegressorConfig(), NetConfig())
+    with pytest.raises(ValueError, match="trajl must be the snippet length"):
+        SplitContext(*args)
+    assert SplitContext(*args, trajl=8).trajl == 8
+
+
+def test_trajectory_extraction_pins_extra_depth_and_warns_on_overlap(caplog):
+    """The real tracker defaults extra_depth to self.trajl-1 when the object carries
+    a trajl attribute, which makes consecutive trajectories share up to trajl-1
+    cells. The notebook got 0 (it extracts before setting trajl); we re-extract on
+    a loaded object, so the value must be pinned, not inherited."""
+    import logging
+
+    from ccpredict.data import extract_trajectories
+
+    class FakeModel:
+        trajl = 8                                  # as a pickle made after In [20] would carry
+
+        def __init__(self, tracks):
+            self._tracks, self.seen_extra_depth = tracks, "not called"
+
+        def get_unique_trajectories(self, cell_inds=None, verbose=False, extra_depth=None):
+            self.seen_extra_depth = extra_depth
+            self.trajectories = self._tracks
+
+    disjoint = FakeModel([np.array([0, 1, 2]), np.array([3, 4, 5])])
+    with caplog.at_level(logging.WARNING, logger="ccpredict.data"):
+        assert len(extract_trajectories(disjoint)) == 2
+    assert disjoint.seen_extra_depth == 0          # pinned, not self.trajl - 1
+    assert "not disjoint" not in caplog.text
+
+    overlapping = FakeModel([np.array([0, 1, 2, 3]), np.array([2, 3, 4, 5])])
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="ccpredict.data"):
+        extract_trajectories(overlapping)
+    assert "not disjoint" in caplog.text and "leakage barrier" in caplog.text
+
+
+def test_attention_ablation_is_an_exact_identity_and_still_trains():
+    """transformer_attention="none" must remove the attention and nothing else:
+    no mixing across snapshots at all, the rest of the block still learning.
+    Without that the arm cannot price what attention is worth."""
+    torch = pytest.importorskip("torch")
+
+    net = _sequence_net("transformer", pool="last", transformer_attention="none").eval()
+    x = torch.rand(3, 8 * 16)
+    disturbed = x.clone()
+    disturbed[:, :16] += 5.0
+    with torch.no_grad():
+        assert torch.allclose(net(x), net(disturbed), atol=1e-6)   # snapshot 0 unreadable
+
+    net.train()
+    net(torch.rand(8, 8 * 16)).sum().backward()
+    p = dict(net.named_parameters())
+    assert p["token.weight"].grad.abs().sum() > 0                  # the block still trains
+    assert p["blocks.layers.0.linear1.weight"].grad.abs().sum() > 0
+    attn = p["blocks.layers.0.self_attn.out_proj.weight"]
+    assert float(attn.abs().max()) == 0.0 and not attn.requires_grad
+    with pytest.raises(ValueError, match="transformer_attention"):
+        _sequence_net("transformer", transformer_attention="bogus")
+
+
+def test_transformer_token_projection_carries_the_weight_penalty():
+    """The projection is the encoder's own weight matrix, so it is penalised like
+    one; the attention internals are not (no Keras counterpart), and an empty
+    regulariser tuple still means no penalty at all."""
+    torch = pytest.importorskip("torch")
+
+    net = _sequence_net("transformer", regularizers=(("l2", 0.5),))
+    assert any(layer is net.token for layer, _ in net._penalties)
+    assert net.penalty().item() > 0
+    assert _sequence_net("transformer", regularizers=()).penalty().item() == 0.0
+    assert torch.allclose(net.positions.detach().mean(), torch.zeros(()), atol=0.05)
 
 
 def test_trajl_reaches_the_network_through_the_split_context():
@@ -412,7 +550,7 @@ def test_trajl_reaches_the_network_through_the_split_context():
     assert ClassifierArm("temporal_conv").cfg(ctx).encoder == "temporal_conv"
 
 
-@pytest.mark.parametrize("encoder", ["snapshot_shared", "temporal_conv"])
+@pytest.mark.parametrize("encoder", ["snapshot_shared", "temporal_conv", "transformer"])
 def test_classifier_trains_with_a_sequence_encoder(encoder, tmp_path):
     """End to end on trajl=4 rows, including the save/load roundtrip (the model
     shape depends on steps, so a checkpoint has to carry it)."""
@@ -641,7 +779,7 @@ def test_neural_arms_differ_only_by_their_overrides():
     from ccpredict.config import ClassifierConfig, NetConfig, RegressorConfig
 
     ctx = SplitContext("s", None, {}, lambda f: None, ClassifierConfig(), RegressorConfig(),
-                       NetConfig())
+                       NetConfig(), trajl=1)
     base = NetConfig()
     for name, overrides in NEURAL_ARMS.items():
         cfg = make_arm(name).cfg(ctx)

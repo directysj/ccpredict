@@ -99,6 +99,7 @@ apart. Which one an encoder works along is the whole difference:
 | `"mlp"` | no convolution; the flat vector into the dense layers |
 | `"snapshot_shared"` | one MLP per snapshot, **weights shared across time**, then `pool` |
 | `"temporal_conv"` | Conv1d along **time** with nf input channels |
+| `"transformer"` | **self-attention among the snapshots** of a snippet, then `pool` |
 
 The notebook's convolution is the odd one out. At `trajl=8`, nf=256 only **14 of
 2048** kernel positions straddle a snapshot boundary, so 99.3% of the kernel
@@ -112,15 +113,46 @@ dense layer:
 | `conv` (notebook) | **4,198,595** |
 | `mlp` | 270,787 |
 | `temporal_conv` | 136,131 |
+| `transformer` | 100,673 |
 | `snapshot_shared` | 90,627 |
 
 Against ~28k training rows with 97% of them in one class. `pool` reduces the
 per-snapshot representation for the dense head: `"concat"` keeps the time order
 (one weight block per snapshot), `"mean"` discards it, `"attention"` learns one
-weight per snapshot from its content. Both sequence encoders end in the same
-pool and head, so comparing them compares the encoder alone.
+weight per snapshot from its content, `"last"` takes the final snapshot — the
+one the label belongs to. Every sequence encoder ends in the same pool and head,
+so comparing them compares the encoder alone.
 
-`clf_conv`, `clf_mlp`, `clf_snapshot_shared` and `clf_temporal_conv` are
+### The transformer encoder
+
+Each snapshot is one token: its nf features projected to `transformer_dim`, plus
+a **learned** positional embedding over the `trajl` slots (the axis is short and
+fixed, so absolute embeddings already span every relative offset), then
+`transformer_layers` pre-norm blocks of multi-head self-attention and a GELU
+feed-forward sublayer. Attention runs over the snapshots, so snapshot *t* can
+read any other snapshot; `snapshot_shared` never mixes snapshots at all and
+`temporal_conv` mixes only within its kernel. `pool="last"` then reads out the
+token for the snapshot the label belongs to, *after* it has attended to the rest
+of the snippet.
+
+Knobs: `transformer_dim` (must divide by `transformer_heads`), `transformer_heads`,
+`transformer_layers`, `transformer_ff`. Two honest caveats:
+
+- **The sequence is 8 tokens long.** Pairwise attention has little room to find
+  something that a single attention *pool* over a shared encoder cannot, so
+  `nn_snapshot_attn_hist` (`snapshot_shared` + `pool="attention"`, one learned
+  weight per snapshot, no query-key term, no extra depth) is in the arm list as
+  the control `nn_transformer_hist` has to beat. Attention blocks that do not
+  beat it have bought nothing but parameters.
+- **The block internals keep PyTorch's own initialisation and carry no l1/l2
+  penalty** — only the token projection does, and the feed-forward sublayer uses
+  GELU rather than the LeakyReLU the rest of the file keeps for Keras parity.
+  Keras-style per-kernel penalties have no standard counterpart inside a
+  transformer block, so inventing one would make the comparison worse, not
+  better. The dense head after the pool is unchanged.
+
+`clf_conv`, `clf_mlp`, `clf_snapshot_shared`, `clf_temporal_conv` and
+`clf_transformer` are
 benchmark arms that train **stage 1 only** (one fit, no forest) and report
 accuracy, balanced accuracy and macro F1 next to the regression metrics, with
 `y_pred` the probability-weighted class mean. That is the cheap way to ask which
@@ -163,6 +195,17 @@ exactly the fields its name mentions, which `tests/test_evaluation.py` checks:
 | `nn_conv` | the notebook's conv encoder, BatchNorm before the activation, no conv bias |
 | `nn_conv_notebook_bn` | as `nn_conv` with the notebook's BatchNorm order and conv bias |
 | `nn_mlp_heavy_reg` | `nn_mlp` with the notebook's l2 0.01 / l1 0.02 penalties |
+
+Sequence arms, for `trajl > 1` (all one-stage: no class bins, no forest). Pass
+`steps=trajl`, which the benchmark does from `features.trajl`:
+
+| arm | what |
+|---|---|
+| `nn_snapshot` / `nn_snapshot_hist` | shared per-snapshot MLP, `pool="last"`, squared / 32-bin head |
+| `nn_tconv` / `nn_tconv_hist` | Conv1d along time, `pool="last"`, squared / 32-bin head |
+| `nn_tconv_concat` | as `nn_tconv` with `pool="concat"`, to price the pooling |
+| `nn_transformer` / `nn_transformer_hist` | self-attention among the snapshots, `pool="last"` |
+| `nn_snapshot_attn_hist` | shared encoder + `pool="attention"`: the cheap attention control |
 
 Three departures from the notebook are defaults here, each with its own
 ablation arm so the cost of the original choice is visible:

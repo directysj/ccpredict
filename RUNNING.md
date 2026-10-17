@@ -144,6 +144,34 @@ python -m ccpredict.benchmark --config bench_labelfix.json --output-dir results_
 Send both folders. Features are prepared again for this one (different labels),
 so it costs one data load on top of the arms.
 
+## One thing to watch in the tracker
+
+`ccpredict` re-runs the tracker's `get_unique_trajectories()` on each loaded
+`.obj` (`data.extract_trajectories`). In `jcTrajectory_CP` that method's
+`extra_depth` argument defaults to `self.trajl - 1` whenever the object happens
+to carry a `trajl` attribute, and where it is non-zero, a trajectory that meets
+an already-tracked one is cut `extra_depth` frames *before* the junction rather
+than at it -- so consecutive trajectories share up to `trajl-1` cells. That is
+deliberate in the tracker (it keeps snippets spanning a junction
+constructible), but it would break every grouped split here, because
+`preprocessing.trajectory_groups` keys on the trajectory index: two snippets
+sharing 7 of 8 snapshots could land on opposite sides of a train/validation
+split and the validation curve would be quietly optimistic.
+
+The notebook got `extra_depth = 0`, because it calls
+`get_unique_trajectories()` (In [14]) *before* assigning `modelSet[i].trajl`
+(In [20]). We now pass `extra_depth=0` explicitly, so a pickle that carries the
+attribute cannot change the grouping, and `extract_trajectories` logs a warning
+naming the two trajectories if any cell ever turns up in both. **If you see
+that warning, stop and tell us** -- the cross-replicate numbers would still be
+sound (train and test are different FOVs, with no cells in common), but
+anything relying on a within-replicate grouped split would not be: early
+stopping, `fit_on="train_holdout"` and `fit_on="train_crossfit"`.
+
+You can check a loaded object directly: `hasattr(model, 'trajl')` after
+unpickling tells you whether the attribute was saved, which is what would have
+triggered it.
+
 The key comparisons: `published_insample` vs `published_crossfit` (is the
 published R an in-sample number?), `rf_vae` vs `rf_vae_insample` (how much does
 in-sample fitting add by itself?), and `published_crossfit` vs `rf_vae` (do the

@@ -123,12 +123,23 @@ class ClassifierConfig:
     #   "mlp"             no convolution, the flat vector into the dense layers
     #   "snapshot_shared" one MLP per snapshot, weights shared across time
     #   "temporal_conv"   Conv1d along time with nf input channels
-    encoder: Literal["conv", "mlp", "snapshot_shared", "temporal_conv"] = "conv"
-    # The two sequence encoders only; see cnn.FeedForwardNet.
+    #   "transformer"     self-attention among the snapshots of the snippet
+    encoder: Literal["conv", "mlp", "snapshot_shared", "temporal_conv",
+                     "transformer"] = "conv"
+    # The sequence encoders only; see cnn.FeedForwardNet.
     snapshot_hidden: Tuple[int, ...] = (64,)
     temporal_filters: Tuple[int, ...] = (64, 64)
     temporal_kernel: int = 3
-    pool: Literal["concat", "mean", "attention"] = "concat"
+    # encoder="transformer" only. transformer_dim must divide by transformer_heads.
+    transformer_dim: int = 64
+    transformer_heads: int = 4
+    transformer_layers: int = 2
+    transformer_ff: int = 128
+    # "none" keeps the whole block (token projection, both LayerNorms, the
+    # feed-forward sublayer) and makes only the attention sublayer the identity.
+    # The ablation that prices attention itself rather than the block around it.
+    transformer_attention: Literal["self", "none"] = "self"
+    pool: Literal["concat", "mean", "attention", "last"] = "concat"
     conv_filters: Tuple[int, ...] = (32, 64)
     dense_units: Tuple[int, ...] = (128, 64)
     dropout: float = 0.2
@@ -256,12 +267,18 @@ class NetConfig:
     # ---- the network ----
     # Same options as ClassifierConfig.encoder (see cnn.FeedForwardNet): "mlp",
     # "conv" (the notebook's, along the flattened axis), "snapshot_shared",
-    # "temporal_conv".
-    encoder: Literal["mlp", "conv", "snapshot_shared", "temporal_conv"] = "mlp"
+    # "temporal_conv", "transformer".
+    encoder: Literal["mlp", "conv", "snapshot_shared", "temporal_conv",
+                     "transformer"] = "mlp"
     snapshot_hidden: Tuple[int, ...] = (64,)
     temporal_filters: Tuple[int, ...] = (64, 64)
     temporal_kernel: int = 3
-    pool: Literal["concat", "mean", "attention"] = "concat"
+    transformer_dim: int = 64
+    transformer_heads: int = 4
+    transformer_layers: int = 2
+    transformer_ff: int = 128
+    transformer_attention: Literal["self", "none"] = "self"
+    pool: Literal["concat", "mean", "attention", "last"] = "concat"
     norm_position: Literal["before_activation", "after_activation"] = "before_activation"
     conv_bias: bool = False
     conv_filters: Tuple[int, ...] = (32, 64)

@@ -86,8 +86,19 @@ class SplitContext:
     classifier_cfg: ClassifierConfig
     regressor_cfg: RegressorConfig
     net_cfg: NetConfig = field(default_factory=NetConfig)
-    trajl: int = 1                 # snapshots per row; the sequence encoders need it
+    # Snapshots per row (features.trajl). No usable default: 1 silently collapses
+    # the time axis, so a sequence encoder becomes a plain net over the flattened
+    # row and a transformer gets a single token -- it still trains and still
+    # reports a number, just not for the model you asked for. 0 forces the caller
+    # to say. (tests/seed_spread.py omitted it once; the results looked ordinary.)
+    trajl: int = 0
     cache: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.trajl < 1:
+            raise ValueError(
+                "SplitContext.trajl must be the snippet length (pass trajl=meta['trajl'] / "
+                "features.trajl); it decides how many snapshots the sequence encoders see")
 
     def X_train(self, feature_set: str) -> np.ndarray:
         return self.train.X[:, self.columns(feature_set)]
@@ -345,7 +356,9 @@ class NeuralArm(Arm):
         info = {"net_epochs": len(model.history.get("loss", [])),
                 "net_best_epoch": int(model.history["best_epoch"][0]),
                 "net_seconds": round(time.time() - t0, 1),
-                "net_encoder": cfg.encoder, "net_head": cfg.head}
+                "net_encoder": cfg.encoder, "net_head": cfg.head,
+                "net_pool": cfg.pool,
+                "n_parameters": sum(p.numel() for p in model.model.parameters())}
         return {f: ArmResult(model.predict(Xs_test[f]), info=dict(info)) for f in ctx.tests}
 
 
@@ -407,7 +420,7 @@ class ClassifierArm(Arm):
 NOTEBOOK_REGULARIZERS = (("l2", 0.01), ("l1", 0.02))
 
 # Encoders compared by the clf_* arms; see cnn.FeedForwardNet for what each does.
-CLASSIFIER_ENCODERS = ("conv", "mlp", "snapshot_shared", "temporal_conv")
+CLASSIFIER_ENCODERS = ("conv", "mlp", "snapshot_shared", "temporal_conv", "transformer")
 
 
 # ----------------------------------------------------------------------------
@@ -430,6 +443,23 @@ NEURAL_ARMS: Dict[str, dict] = {
     "nn_tconv_hist": {"encoder": "temporal_conv", "pool": "last", "head": "histogram"},
     "nn_snapshot": {"encoder": "snapshot_shared", "pool": "last"},
     "nn_snapshot_hist": {"encoder": "snapshot_shared", "pool": "last", "head": "histogram"},
+    # Self-attention among the snapshots of a snippet: every snapshot can read
+    # every other one, which neither encoder above can do. "last" reads out the
+    # token for the snapshot the label belongs to, after it has attended to the
+    # other seven.
+    "nn_transformer": {"encoder": "transformer", "pool": "last"},
+    "nn_transformer_hist": {"encoder": "transformer", "pool": "last", "head": "histogram"},
+    # Prices the attention itself: identical block (token projection, both
+    # LayerNorms, feed-forward sublayer), attention sublayer made the identity.
+    # Whatever this arm scores is what the *block* is worth; only the gap above
+    # it belongs to attention.
+    "nn_transformer_noattn": {"encoder": "transformer", "pool": "last",
+                              "transformer_attention": "none"},
+    # The control nn_transformer_hist has to beat before its attention blocks can
+    # be said to have earned anything: one learned weight per snapshot from that
+    # snapshot's own content, with no pairwise query-key term and no extra depth.
+    "nn_snapshot_attn_hist": {"encoder": "snapshot_shared", "pool": "attention",
+                              "head": "histogram"},
     # Ablations of the notebook's two choices, one at a time.
     "nn_conv_notebook_bn": {"encoder": "conv", "norm_position": "after_activation",
                             "conv_bias": True},

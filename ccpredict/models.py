@@ -42,7 +42,12 @@ def build_cnn_classifier(input_dim: int, num_classes: int, cfg: ClassifierConfig
                           cfg.dropout, cfg.regularizers, encoder=cfg.encoder, steps=steps,
                           snapshot_hidden=cfg.snapshot_hidden,
                           temporal_filters=cfg.temporal_filters,
-                          temporal_kernel=cfg.temporal_kernel, pool=cfg.pool)
+                          temporal_kernel=cfg.temporal_kernel, pool=cfg.pool,
+                          transformer_dim=cfg.transformer_dim,
+                          transformer_heads=cfg.transformer_heads,
+                          transformer_layers=cfg.transformer_layers,
+                          transformer_ff=cfg.transformer_ff,
+                          transformer_attention=cfg.transformer_attention)
 
 
 class StageOneClassifier:
@@ -164,7 +169,12 @@ def build_net(input_dim: int, out_features: int, cfg: NetConfig, steps: int = 1)
                           norm_position=cfg.norm_position, conv_bias=cfg.conv_bias,
                           steps=steps, snapshot_hidden=cfg.snapshot_hidden,
                           temporal_filters=cfg.temporal_filters,
-                          temporal_kernel=cfg.temporal_kernel, pool=cfg.pool)
+                          temporal_kernel=cfg.temporal_kernel, pool=cfg.pool,
+                          transformer_dim=cfg.transformer_dim,
+                          transformer_heads=cfg.transformer_heads,
+                          transformer_layers=cfg.transformer_layers,
+                          transformer_ff=cfg.transformer_ff,
+                          transformer_attention=cfg.transformer_attention)
 
 
 class DirectRegressor:

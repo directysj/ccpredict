@@ -83,7 +83,12 @@ class Trajectory:
     def __init__(self, **attrs):
         self.__dict__.update(attrs)
 
-    def get_unique_trajectories(self):
+    def get_unique_trajectories(self, cell_inds=None, verbose=False, extra_depth=None):
+        # Signature matches the real jcTrajectory_CP so data.py can pass
+        # extra_depth=0. The simulator's tracks are disjoint by construction
+        # (see _trace_back), which is what extra_depth=0 produces there too.
+        if extra_depth:
+            raise ValueError("the simulator builds disjoint tracks; extra_depth>0 is not modelled")
         self.trajectories = [np.asarray(t).copy() for t in self._tracks]
 '''
 

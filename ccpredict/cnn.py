@@ -46,6 +46,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _disable_attention(block: nn.Module) -> None:
+    """Make one TransformerEncoderLayer's attention sublayer the exact identity.
+
+    The output projection is zeroed and frozen, so ``self_attn`` returns exactly
+    zero for every input and, with pre-norm residuals ``h = h + attn(norm(h))``,
+    contributes nothing. No gradient reaches the query/key/value projections
+    either (they are multiplied by a zero matrix), so they stay at their
+    initialisation. The module itself is left in place rather than replaced,
+    because nn.TransformerEncoder introspects ``self_attn`` and a stand-in has
+    to mimic attributes that differ between torch versions.
+
+    Everything else in the block -- token projection, both LayerNorms, the
+    feed-forward sublayer -- is untouched. That is what prices attention
+    itself: hold the rest of the encoder fixed and see what the query-key
+    machinery adds on top of it (see transformer_attention in config.py).
+    """
+    with torch.no_grad():
+        block.self_attn.out_proj.weight.zero_()
+        if block.self_attn.out_proj.bias is not None:
+            block.self_attn.out_proj.bias.zero_()
+    block.self_attn.requires_grad_(False)
+
+
 class KerasBatchNorm1d(nn.Module):
     """BatchNorm over (N, C, L) with Keras semantics (momentum on the old value, biased variance)."""
 
@@ -70,9 +93,9 @@ class KerasBatchNorm1d(nn.Module):
         return (x - mean[None, :, None]) * inv[None, :, None] + self.bias[None, :, None]
 
 
-ENCODERS = ("conv", "mlp", "snapshot_shared", "temporal_conv")
+ENCODERS = ("conv", "mlp", "snapshot_shared", "temporal_conv", "transformer")
 # Encoders that read the input as a sequence of snapshots and so need ``steps``.
-SEQUENCE_ENCODERS = ("snapshot_shared", "temporal_conv")
+SEQUENCE_ENCODERS = ("snapshot_shared", "temporal_conv", "transformer")
 POOLS = ("concat", "mean", "attention", "last")
 
 
@@ -103,6 +126,29 @@ class FeedForwardNet(nn.Module):
         Conv1d along *time* with nf input channels (``temporal_filters``,
         ``temporal_kernel``), i.e. the notebook's idea applied to the axis where
         neighbours are neighbours. No pooling over time: the axis is short.
+    encoder="transformer"
+        Each snapshot is one token: ``nf`` features projected to
+        ``transformer_dim`` and added to a *learned* positional embedding, then
+        ``transformer_layers`` pre-norm blocks of multi-head self-attention plus
+        a feed-forward sublayer. Attention runs over the ``steps`` snapshots of
+        the snippet, so every snapshot can read every other one; the two
+        encoders above cannot do that (``snapshot_shared`` never mixes
+        snapshots at all, ``temporal_conv`` only mixes neighbours within its
+        kernel). Positions are learned rather than sinusoidal because ``steps``
+        is small and fixed, and absolute embeddings over 8 slots already span
+        every relative offset the head could want.
+
+        Two caveats worth knowing before reading a comparison. The sequence is
+        8 tokens long, which is short enough that pairwise attention has little
+        to find that an attention *pool* over a shared encoder cannot;
+        ``pool="attention"`` on ``snapshot_shared`` is the cheap version of the
+        same idea and the honest baseline to beat. And the self-attention
+        internals keep PyTorch's own initialisation and carry no l1/l2 penalty
+        (only the token projection does), because Keras-style per-kernel
+        penalties have no standard counterpart inside a transformer block. The
+        feed-forward sublayer uses GELU, as transformers do, not the LeakyReLU
+        the rest of this file keeps for Keras parity; the dense head after the
+        pool is unchanged.
 
     ``pool`` reduces the per-step representation for the dense head: "concat"
     keeps the order (a weight per step), "mean" discards it, "attention" learns
@@ -125,7 +171,10 @@ class FeedForwardNet(nn.Module):
                  regularizers=(("l2", 0.01), ("l1", 0.02)), negative_slope: float = 0.3,
                  encoder: str = "conv", norm_position: str = "after_activation",
                  conv_bias: bool = True, steps: int = 1, snapshot_hidden=(64,),
-                 temporal_filters=(64, 64), temporal_kernel: int = 3, pool: str = "concat"):
+                 temporal_filters=(64, 64), temporal_kernel: int = 3, pool: str = "concat",
+                 transformer_dim: int = 64, transformer_heads: int = 4,
+                 transformer_layers: int = 2, transformer_ff: int = 128,
+                 transformer_attention: str = "self"):
         super().__init__()
         if encoder not in ENCODERS:
             raise ValueError(f"encoder must be one of {ENCODERS}, not {encoder!r}")
@@ -139,6 +188,8 @@ class FeedForwardNet(nn.Module):
         self.convs, self.norms = nn.ModuleList(), nn.ModuleList()
         self.snapshot, self.tconvs, self.tnorms = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         self.attention = None
+        self.token = self.blocks = self.final_norm = None
+        self.positions = None
         width = input_dim
 
         if encoder in SEQUENCE_ENCODERS:
@@ -157,6 +208,30 @@ class FeedForwardNet(nn.Module):
                 for u in snapshot_hidden:
                     self.snapshot.append(nn.Linear(w, u))
                     w = u
+            elif encoder == "transformer":
+                if transformer_dim % transformer_heads:
+                    raise ValueError(
+                        f"transformer_dim ({transformer_dim}) must divide by transformer_heads "
+                        f"({transformer_heads}): each head takes dim/heads of the embedding.")
+                if transformer_layers < 1:
+                    raise ValueError(f"transformer_layers must be at least 1, "
+                                     f"got {transformer_layers}")
+                w = transformer_dim
+                self.token = nn.Linear(nf, w)                  # one token per snapshot
+                # Learned absolute positions: ``steps`` is small, fixed and known here.
+                self.positions = nn.Parameter(torch.zeros(steps, w))
+                layer = nn.TransformerEncoderLayer(
+                    d_model=w, nhead=transformer_heads, dim_feedforward=transformer_ff,
+                    dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
+                self.blocks = nn.TransformerEncoder(layer, num_layers=transformer_layers,
+                                                    enable_nested_tensor=False)
+                if transformer_attention not in ("self", "none"):
+                    raise ValueError("transformer_attention must be 'self' or 'none', "
+                                     f"not {transformer_attention!r}")
+                if transformer_attention == "none":     # ablation: keep the block, drop attention
+                    for block in self.blocks.layers:
+                        _disable_attention(block)
+                self.final_norm = nn.LayerNorm(w)
             else:
                 channels = nf
                 for f in temporal_filters:
@@ -186,7 +261,8 @@ class FeedForwardNet(nn.Module):
         # again from the start for the dense layers (conv1 l2, conv2 l1, dense1 l2,
         # dense2 l1). An empty tuple means no penalty at all.
         regs = list(regularizers)
-        encoder_layers = list(self.convs) + list(self.snapshot) + list(self.tconvs)
+        encoder_layers = (list(self.convs) + list(self.snapshot) + list(self.tconvs)
+                          + ([self.token] if self.token is not None else []))
         self._penalties = ([] if not regs else
                            [(c, regs[i % len(regs)]) for i, c in enumerate(encoder_layers)]
                            + [(d, regs[i % len(regs)]) for i, d in enumerate(self.denses)])
@@ -195,6 +271,11 @@ class FeedForwardNet(nn.Module):
             nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
+        if self.positions is not None:
+            # Small, not zero: identical positions would leave the stack
+            # permutation-equivariant at init and the order would have to be
+            # learned out of the attention weights alone.
+            nn.init.normal_(self.positions, std=0.02)
 
     def _per_step(self, x: torch.Tensor) -> torch.Tensor:
         """(N, steps * nf) -> (N, steps, width): one representation per snapshot."""
@@ -205,6 +286,11 @@ class FeedForwardNet(nn.Module):
             for lin in self.snapshot:
                 x = self.drop(F.leaky_relu(lin(x), self.negative_slope))
             return x
+        if self.encoder == "transformer":
+            # (N, steps, nf) -> (N, steps, d_model). Attention is taken over dim 1,
+            # the snapshots of the snippet, so token t can read every other token.
+            x = self.drop(self.token(x) + self.positions)
+            return self.final_norm(self.blocks(x))
         x = x.transpose(1, 2)                                      # (N, nf, steps): nf = channels
         for conv, norm in zip(self.tconvs, self.tnorms):
             if self.norm_position == "after_activation":

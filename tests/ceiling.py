@@ -17,9 +17,23 @@ cross-replicate (EGF1 -> EGF2), on four different inputs:
                        and the measured label, i.e. the reporter-noise cap
 
 Read the gaps: noisy -> clean is what denoising could buy, clean -> truth what a
-better encoder could buy, and truth -> nc_true what nothing can buy. If the
-benchmark's arms all sit at the "noisy embeddings" number, the simulator has no
-headroom left and it cannot be used to show that a modelling change helps.
+better encoder could buy, and truth -> nc_true what nothing can buy.
+
+**These are not upper bounds, and the "noisy embeddings" row least of all.**
+Every row except nc_true is "the better of a random forest and the default-MLP
+DirectRegressor, fitted on *this* input at trajl=1". That is a bound on two
+model classes, not on what is achievable: both read absolute feature levels,
+and the MLP carries BatchNorm statistics frozen on EGF1 into an EGF2 test set.
+A model outside those classes can exceed any row here without contradicting the
+simulator's information content -- a transformer over the snippet's snapshots
+does exactly that (results/regression_trajl8.md). Treat the numbers as "what
+these two models extract", and read a *gap* as suggestive rather than as signal
+that provably cannot be reached. Only nc_true is a real cap: it involves no
+model, just the label against the ratio it is a noisy copy of.
+
+In particular, arms sitting at the "noisy embeddings" number does NOT show the
+simulator is exhausted. It shows those arms do no better than these two -- which
+may mean they share a weakness rather than that there is nothing left.
 """
 from __future__ import annotations
 

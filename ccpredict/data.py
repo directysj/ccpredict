@@ -118,9 +118,41 @@ def standardize_com_displacement(models: Sequence[object]) -> None:
 
 
 def extract_trajectories(model) -> list:
-    """Run the tracker's get_unique_trajectories() and return a copy of the list (In [14])."""
-    model.get_unique_trajectories()
-    return list(model.trajectories)
+    """Run the tracker's get_unique_trajectories() and return a copy of the list (In [14]).
+
+    ``extra_depth=0`` is passed explicitly, and that matters. In the real
+    jcTrajectory_CP, get_unique_trajectories defaults it to ``self.trajl - 1``
+    when the object happens to carry a ``trajl`` attribute, and to 0 otherwise.
+    Where it is non-zero, trajectories that meet an already-tracked one are cut
+    ``extra_depth`` frames *before* the junction instead of at it, so
+    consecutive trajectories share up to trajl-1 cells -- deliberate, so that
+    snippets spanning a junction stay constructible.
+
+    The notebook got 0: it calls get_unique_trajectories (In [14]) before
+    assigning ``modelSet[i].trajl`` (In [20]), so the attribute does not exist
+    yet. But we re-extract on a *loaded* object, and if that object was pickled
+    after In [20] the attribute is in the pickle -- so inheriting the default
+    would silently give us overlapping trajectories where the notebook had
+    disjoint ones. Overlapping trajectories would also break every grouped
+    split: preprocessing.trajectory_groups keys on the trajectory index, so two
+    snippets sharing 7 of 8 snapshots would be free to land on opposite sides
+    of a train/validation split. Pinning it to 0 reproduces the notebook
+    whatever the pickle contains.
+    """
+    model.get_unique_trajectories(extra_depth=0)
+    trajectories = list(model.trajectories)
+    seen: dict = {}
+    for i, traj in enumerate(trajectories):
+        for cell in np.asarray(traj).ravel():
+            if cell in seen:
+                log.warning(
+                    "trajectories %d and %d both contain cell %d: they are not disjoint, so "
+                    "grouping by trajectory is not a leakage barrier (two snippets may share "
+                    "up to trajl-1 snapshots across a split). Check whether the tracker was "
+                    "run with extra_depth > 0.", seen[cell], i, int(cell))
+                return trajectories
+            seen[cell] = i
+    return trajectories
 
 
 # ----------------------------------------------------------------------------
