@@ -85,6 +85,65 @@ guide for running it on the real data.**
   validation slice, and forest R under random-row, trajectory, FOV and test
   splits.
 
+## Encoders: which axis of the input the network works along
+
+A row of features is `trajl` snapshots of one cell concatenated,
+`[snapshot 0 features | snapshot 1 features | ...]` with nf features each
+(`data.py` builds it that way; `benchmark.column_selector` keeps the stride).
+The nf axis is a set of channels with no order. The `trajl` axis is time, 15 min
+apart. Which one an encoder works along is the whole difference:
+
+| `classifier.encoder` / `net.encoder` | what it does |
+|---|---|
+| `"conv"` (the notebook, default) | width-3 Conv1d along the **flattened** vector |
+| `"mlp"` | no convolution; the flat vector into the dense layers |
+| `"snapshot_shared"` | one MLP per snapshot, **weights shared across time**, then `pool` |
+| `"temporal_conv"` | Conv1d along **time** with nf input channels |
+
+The notebook's convolution is the odd one out. At `trajl=8`, nf=256 only **14 of
+2048** kernel positions straddle a snapshot boundary, so 99.3% of the kernel
+mixes arbitrary feature dimensions *inside* one snapshot, and the few that cross
+mix the tail dimensions of one snapshot with the head dimensions of the next.
+It is also where the parameters go, because the flatten after pooling feeds one
+dense layer:
+
+| encoder | parameters (trajl=8, nf=256, 3 classes) |
+|---|---|
+| `conv` (notebook) | **4,198,595** |
+| `mlp` | 270,787 |
+| `temporal_conv` | 136,131 |
+| `snapshot_shared` | 90,627 |
+
+Against ~28k training rows with 97% of them in one class. `pool` reduces the
+per-snapshot representation for the dense head: `"concat"` keeps the time order
+(one weight block per snapshot), `"mean"` discards it, `"attention"` learns one
+weight per snapshot from its content. Both sequence encoders end in the same
+pool and head, so comparing them compares the encoder alone.
+
+`clf_conv`, `clf_mlp`, `clf_snapshot_shared` and `clf_temporal_conv` are
+benchmark arms that train **stage 1 only** (one fit, no forest) and report
+accuracy, balanced accuracy and macro F1 next to the regression metrics, with
+`y_pred` the probability-weighted class mean. That is the cheap way to ask which
+architecture classifies best. The `nn_*` arms take the same `encoder` switch.
+
+## Stage 2: where it gets its training rows
+
+`regressor.fit_on` decides both which rows stage 2 is fitted on and whose
+stage-1 probabilities it sees. Only the last two are honest about both:
+
+| `fit_on` | stage 2 trained on | stage-1 probabilities | cost |
+|---|---|---|---|
+| `"test"` (notebook default) | the test FOV, then scored on the same rows | in-sample | 1 fit |
+| `"train"` | training FOVs | stage 1's own training rows, over-confident | 1 fit |
+| `"train_crossfit"` | training FOVs | out-of-fold, one stage 1 per held-out FOV | 1 + K fits |
+| `"train_holdout"` | a held-out share of training trajectories | out-of-sample from one stage 1 | 1 fit |
+
+`train_holdout` splits the training block by whole trajectories
+(`stage2_fraction`, `stage2_seed`), trains stage 1 on one part and stage 2 on the
+other, and scores the test FOVs with that same stage 1. It costs one classifier
+fit instead of K, at the price of less data for each stage. Arms:
+`published_crossfit`, `published_holdout`, and `_groupedval` variants of both.
+
 ## One-stage neural regressors
 
 The published model turns a continuous, strongly skewed target into three bins
@@ -124,7 +183,8 @@ and a regression head's output bias starts at the mean training target, so
 epoch 0 is the constant baseline rather than a drift towards it.
 
 **What these scored on the simulator** is in
-[results/simulator_tweaks.md](results/simulator_tweaks.md), with the seed
+[results/simulator_tweaks.md](results/simulator_tweaks.md) (and, at `trajl=8`
+with the corrected label, [results/regression_trajl8.md](results/regression_trajl8.md)), with the seed
 spread of each arm (differences below ~0.01 R are noise) and a measurement of
 how much signal is left to win. In short: `nn_mlp_hist` was the best of them,
 the convolution costs 0.05 R and 18x the runtime, the notebook's penalties
@@ -176,13 +236,22 @@ notebook.
 
 ## Behaviour preserved from the notebook (switches)
 
+**Two defaults on this branch no longer match the notebook.** The ground truth
+N/C belongs to the **last snapshot of the snippet**, so `label_frame` defaults to
+`"snippet_end"` and `include_last_window` to `True`. The notebook read the label
+at `frame(start) + trajl`, one frame (15 min) *past* the window, which is a
+defect rather than a design choice: it fits labels shifted into the future, and
+fixing it is worth 0.03-0.05 Pearson R to every arm on simulated data. The
+notebook's values remain available and are pinned explicitly by `tests/parity`,
+which still reproduces the notebook bit for bit.
+
 | Switch | Notebook (default) | Alternative | What the default does |
 |---|---|---|---|
 | `regressor.fit_on` | `"test"` | `"train_crossfit"` (or `"train"`) | The forest is fitted on the test FOV and scored on the same rows, so stage-2 MSE/R/R² are training-set numbers. `"train_crossfit"` fits it on the training FOVs with out-of-fold CNN probabilities; `"train"` uses the CNN's in-sample probabilities, which are over-confident. |
 | `classifier.validation` | `"keras_tail"` | `"grouped_holdout"` | The oversampler appends duplicates at the end, grouped by class, and Keras's `validation_split` takes the last 20%. Validation is therefore copies of minority-class training rows, and early stopping (which restores the best weights) is driven by them. `"grouped_holdout"` holds out 20% of trajectories before oversampling. |
 | `qc.evaluate_on_frames` | `False` | `True` | The spline is evaluated on a 10,000-point grid and indexed by frame number, so frames 136–190 are compared with the smoothed count at frames ~2.6–3.7. The score is then roughly a coefficient of variation of late counts. If you switch this on, recalibrate `qc.std_cut`: the scores drop about tenfold. |
-| `features.include_last_window` | `False` | `True` | `range(traj_len - seg_length)` drops the last window of every trajectory, and trajectories exactly `trajl` long yield nothing. On its own this switch changes nothing: the last window's label is read past the end of the trajectory, so that row is dropped as unlabelled either way. Fixing `label_frame` recovers those rows as well. |
-| `features.label_frame` | `"start_plus_trajl"` | `"snippet_end"` | The label is read at `frame(first cell) + trajl`, one frame after the snippet's last cell. With `trajl=1` that is the next frame's reporter value, so the model is scored on predicting the reporter 15 min into the future from the current morphology. **On the simulator this costs 0.03-0.05 R for every arm** ([results/simulator_tweaks.md](results/simulator_tweaks.md)), which is more than any model change tried so far. |
+| `features.include_last_window` | `True` (branch default; notebook used `False`) | `False` | `range(traj_len - seg_length)` drops the last window of every trajectory, and trajectories exactly `trajl` long yield nothing. On its own this switch changes nothing: the last window's label is read past the end of the trajectory, so that row is dropped as unlabelled either way. Fixing `label_frame` recovers those rows as well. |
+| `features.label_frame` | `"snippet_end"` (branch default; notebook used `"start_plus_trajl"`) | `"start_plus_trajl"` | The label is read at `frame(first cell) + trajl`, one frame after the snippet's last cell. With `trajl=1` that is the next frame's reporter value, so the model is scored on predicting the reporter 15 min into the future from the current morphology. **On the simulator this costs 0.03-0.05 R for every arm** ([results/simulator_tweaks.md](results/simulator_tweaks.md)), which is more than any model change tried so far. |
 | `classifier.seed` | `None` | an int | The notebook sets no seed, so its training is not reproducible. |
 
 `regressor.use_rfecv = False` replaces RFECV by a single forest on all features

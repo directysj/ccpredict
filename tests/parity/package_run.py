@@ -39,6 +39,10 @@ def main() -> None:
     from ccpredict.preprocessing import make_oversampler
 
     cfg = PipelineConfig()
+    # The notebook's own label semantics, pinned: the package defaults now read the
+    # label at the snippet's last snapshot, which the notebook did not.
+    cfg.features.label_frame = "start_plus_trajl"
+    cfg.features.include_last_window = False
     cfg.paths.traj_dir = args.fixture
     cfg.paths.vae_dir = os.path.join(args.fixture, "o2vae")
     cfg.paths.reporter_dir = os.path.join(args.fixture, "reporter")

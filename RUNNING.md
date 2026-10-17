@@ -1,6 +1,6 @@
 # Running the benchmark on the real data
 
-This is to run on LI204601 files. It compares the model
+This is for whoever has access to the LI204601 files. It compares the model
 published in the preprint (VAE features + CNN class probabilities + RFECV
 random forest) with baselines and with honest versions of the same model, all
 on the same rows. Your run produces a results folder; send that back.
@@ -78,12 +78,14 @@ Expect most of a day on one CPU node. To cut it:
   `--arms published_crossfit_groupedval`; the `nn_*` arms are minutes each and
   can go in the fast job.
 
-If you change any setting, keep it the same across all arms.
+If you change any setting, keep it the same across all arms and say so when you
+send results back.
 
-## 5. About results directory
+## 5. What to send back
 
-The `results/` folder **without `cache/`** (it holds the features).
-`predictions/` holds per-cell predicted and measured N/C. `report.md` alone already answers the
+Send the `results/` folder **without `cache/`** (it holds the features).
+`predictions/` holds per-cell predicted and measured N/C; include it if that is
+fine for you, otherwise leave it out. `report.md` alone already answers the
 main questions.
 
 ## What the arms are
@@ -104,6 +106,17 @@ main questions.
 | `nn_conv` | `nn_mlp` with the notebook's conv encoder (BatchNorm before the activation, no conv bias) |
 | `nn_conv_notebook_bn` | as `nn_conv` but with the notebook's BatchNorm order and conv bias |
 | `nn_mlp_heavy_reg` | `nn_mlp` with the notebook's l2 0.01 / l1 0.02 penalties |
+| `clf_conv` | stage 1 only, the notebook's encoder: 4.2M parameters at trajl=8 |
+| `clf_mlp` | stage 1 only, no convolution (270k parameters) |
+| `clf_snapshot_shared` | stage 1 only, one MLP per snapshot with weights shared across time (91k) |
+| `clf_temporal_conv` | stage 1 only, Conv1d along time with nf input channels (136k) |
+| `published_holdout` | stage 2 trained on held-out training trajectories, one classifier fit |
+
+The four `clf_*` arms are one classifier fit each and no forest, so they are the
+cheap way to compare architectures on the classification task: the report prints
+accuracy, majority-class accuracy, balanced accuracy and macro F1 for each. Their
+R is not comparable with the other arms' - a 3-class classifier can only emit
+three values, so `y_pred` is the probability-weighted class mean.
 
 The `nn_*` arms are minutes each, not hours, so include them all. README.md
 explains what each one is for and [results/simulator_tweaks.md](results/simulator_tweaks.md)
@@ -128,7 +141,7 @@ python -m ccpredict.benchmark --config bench_labelfix.json --output-dir results_
     --arms constant,lasso_vae,rf_vae,nn_mlp,nn_mlp_hist
 ```
 
-Features are prepared again for this one (different labels),
+Send both folders. Features are prepared again for this one (different labels),
 so it costs one data load on top of the arms.
 
 The key comparisons: `published_insample` vs `published_crossfit` (is the

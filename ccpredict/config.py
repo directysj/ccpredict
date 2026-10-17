@@ -81,12 +81,18 @@ class FeatureConfig:
     handcrafted_from_col: Optional[int] = None
     # Commented-out notebook option: append centre-of-mass features Xf_com.
     append_com: bool = False
-    # NOTEBOOK DEFECT: range(traj_len - seg_length) drops the last window of
-    # every trajectory (and every length-trajl trajectory entirely).
-    include_last_window: bool = False
-    # NOTEBOOK DEFECT: labels are read at frame(start) + trajl, one frame past
-    # the snippet's last cell. "snippet_end" reads the frame of the last cell.
-    label_frame: Literal["start_plus_trajl", "snippet_end"] = "start_plus_trajl"
+    # The notebook used False, which drops the last window of every trajectory
+    # (and every length-trajl trajectory entirely). With label_frame below set
+    # to the notebook's value those rows had no label anyway; with
+    # "snippet_end" they do, so keeping them adds ~2% more labelled rows.
+    include_last_window: bool = True
+    # The ground truth N/C belongs to the LAST snapshot of the snippet.
+    # "snippet_end" reads the frame of that snapshot, which is the intended
+    # semantics. The notebook read frame(start) + trajl, one frame (15 min)
+    # past the window, so it fitted labels shifted into the future; that is a
+    # defect, not a design choice, and costs 0.03-0.05 Pearson R on simulated
+    # data. "start_plus_trajl" reproduces it and is what tests/parity pins.
+    label_frame: Literal["start_plus_trajl", "snippet_end"] = "snippet_end"
 
 
 @dataclass
@@ -110,6 +116,19 @@ class ClassifierConfig:
     """
 
     class_boundaries: Tuple[float, ...] = (0.9, 2.7)
+    # Which axis of the (trajl x nf) input the encoder works along; see
+    # cnn.FeedForwardNet. "conv" is the notebook (a width-3 kernel along the
+    # flattened vector, so almost entirely within one snapshot). The other three
+    # are alternatives to compare it with, not defaults:
+    #   "mlp"             no convolution, the flat vector into the dense layers
+    #   "snapshot_shared" one MLP per snapshot, weights shared across time
+    #   "temporal_conv"   Conv1d along time with nf input channels
+    encoder: Literal["conv", "mlp", "snapshot_shared", "temporal_conv"] = "conv"
+    # The two sequence encoders only; see cnn.FeedForwardNet.
+    snapshot_hidden: Tuple[int, ...] = (64,)
+    temporal_filters: Tuple[int, ...] = (64, 64)
+    temporal_kernel: int = 3
+    pool: Literal["concat", "mean", "attention"] = "concat"
     conv_filters: Tuple[int, ...] = (32, 64)
     dense_units: Tuple[int, ...] = (128, 64)
     dropout: float = 0.2
@@ -165,12 +184,23 @@ class RegressorConfig:
     rfecv_step: int = 1
     min_features_to_select: int = 50
     scoring: str = "neg_mean_squared_error"
-    # NOTEBOOK DEFECT: the regressor is fitted on the test FOV and then
-    # evaluated on the same rows, so its MSE/R/R^2 are training-set numbers.
-    # "train" fits on the trimmed training FOVs using the classifier's in-sample
-    # probabilities (over-confident); "train_crossfit" uses out-of-fold
-    # probabilities, one classifier per held-out training FOV (proper stacking).
-    fit_on: Literal["test", "train", "train_crossfit"] = "test"
+    # Where stage 2 gets its training rows, and whose stage-1 probabilities it
+    # sees. Only the last two are honest about both at once:
+    #   "test"           NOTEBOOK DEFECT: fitted on the test FOV and scored on
+    #                    the same rows, so MSE/R/R^2 are training-set numbers.
+    #   "train"          the trimmed training FOVs, but with stage 1's in-sample
+    #                    probabilities, which are more confident than the ones it
+    #                    will meet on a new FOV.
+    #   "train_crossfit" out-of-fold probabilities, one stage 1 per held-out
+    #                    training FOV: all the data, K extra classifier fits.
+    #   "train_holdout"  one stage 1 on part of the training trajectories, stage 2
+    #                    on the rest with that model's out-of-sample probabilities:
+    #                    one classifier fit, less data for each stage.
+    fit_on: Literal["test", "train", "train_crossfit", "train_holdout"] = "test"
+    # fit_on="train_holdout": the share of training *trajectories* kept for
+    # stage 2 (grouped, so no cell appears in both stages).
+    stage2_fraction: float = 0.3
+    stage2_seed: int = 42
     # False replaces RFECV by a single forest on all features (much faster).
     use_rfecv: bool = True
 
@@ -224,7 +254,14 @@ class NetConfig:
     weight_clip: float = 10.0
 
     # ---- the network ----
-    encoder: Literal["mlp", "conv"] = "mlp"
+    # Same options as ClassifierConfig.encoder (see cnn.FeedForwardNet): "mlp",
+    # "conv" (the notebook's, along the flattened axis), "snapshot_shared",
+    # "temporal_conv".
+    encoder: Literal["mlp", "conv", "snapshot_shared", "temporal_conv"] = "mlp"
+    snapshot_hidden: Tuple[int, ...] = (64,)
+    temporal_filters: Tuple[int, ...] = (64, 64)
+    temporal_kernel: int = 3
+    pool: Literal["concat", "mean", "attention"] = "concat"
     norm_position: Literal["before_activation", "after_activation"] = "before_activation"
     conv_bias: bool = False
     conv_filters: Tuple[int, ...] = (32, 64)

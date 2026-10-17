@@ -70,60 +70,164 @@ class KerasBatchNorm1d(nn.Module):
         return (x - mean[None, :, None]) * inv[None, :, None] + self.bias[None, :, None]
 
 
+ENCODERS = ("conv", "mlp", "snapshot_shared", "temporal_conv")
+# Encoders that read the input as a sequence of snapshots and so need ``steps``.
+SEQUENCE_ENCODERS = ("snapshot_shared", "temporal_conv")
+POOLS = ("concat", "mean", "attention", "last")
+
+
 class FeedForwardNet(nn.Module):
     """The notebook's create_model, with the departures from it as explicit switches.
 
-    Default (encoder="conv", norm_position="after_activation", conv_bias=True) is the
-    notebook: 2 x [conv, LeakyReLU, BN, maxpool, dropout], 2 x [dense, LeakyReLU,
-    dropout], linear output. forward returns logits (or, for a regression head, the
-    raw output); the Objective turns them into predictions.
+    A row of features is ``trajl`` snapshots of the same cell concatenated:
+    ``[snapshot 0 features | snapshot 1 features | ...]``, nf features each
+    (data.py builds it that way, and benchmark.column_selector keeps that
+    stride). The nf axis is a set of channels with no order; the ``steps`` axis
+    is time, 15 min apart. Which of the two an encoder works along is the whole
+    difference between these options:
 
-    encoder="mlp" drops the convolutions and feeds the features straight to the dense
-    layers. norm_position="before_activation" normalises before LeakyReLU instead of
+    encoder="conv" (the notebook, the default)
+        Conv1d with a width-3 kernel along the *flattened* vector, so it mixes
+        three neighbouring entries of ``[s0 | s1 | ...]``. At trajl=8, nf=256
+        only 14 of 2048 kernel positions straddle a snapshot boundary: 99.3% of
+        the kernel mixes arbitrary feature dimensions *within* one snapshot.
+        Kept bit-exact for comparison, not because it is sensible.
+    encoder="mlp"
+        No convolution; the flat vector goes straight to the dense layers.
+    encoder="snapshot_shared"
+        One MLP (``snapshot_hidden``) applied to every snapshot with the weights
+        shared across time, then ``pool``. Weight sharing along the only axis
+        that has an order, and ``steps`` times fewer parameters than the flat
+        net for the same width.
+    encoder="temporal_conv"
+        Conv1d along *time* with nf input channels (``temporal_filters``,
+        ``temporal_kernel``), i.e. the notebook's idea applied to the axis where
+        neighbours are neighbours. No pooling over time: the axis is short.
+
+    ``pool`` reduces the per-step representation for the dense head: "concat"
+    keeps the order (a weight per step), "mean" discards it, "attention" learns
+    one weight per step from its own content, and "last" takes the final step
+    only. "last" is the right default when the label belongs to the last
+    snapshot of the snippet, which is how this pipeline defines it: that step's
+    representation has already seen the earlier ones through the receptive
+    field, and the head needs a weight per feature instead of per feature and
+    step. "mean" is the wrong choice for such a label, since it dilutes the
+    snapshot the label is about. Both sequence encoders end in the same pool and
+    head, so a comparison between them is a comparison of the encoder alone.
+
+    norm_position="before_activation" normalises before LeakyReLU instead of
     after; the conv bias is then provably redundant, so conv_bias=False goes with it.
+    forward returns logits (or, for a regression head, the raw output).
     """
 
     def __init__(self, input_dim: int, out_features: int, conv_filters=(32, 64),
                  dense_units=(128, 64), dropout: float = 0.2,
                  regularizers=(("l2", 0.01), ("l1", 0.02)), negative_slope: float = 0.3,
                  encoder: str = "conv", norm_position: str = "after_activation",
-                 conv_bias: bool = True):
+                 conv_bias: bool = True, steps: int = 1, snapshot_hidden=(64,),
+                 temporal_filters=(64, 64), temporal_kernel: int = 3, pool: str = "concat"):
         super().__init__()
-        if encoder not in ("conv", "mlp"):
-            raise ValueError(f"encoder must be 'conv' or 'mlp', not {encoder!r}")
+        if encoder not in ENCODERS:
+            raise ValueError(f"encoder must be one of {ENCODERS}, not {encoder!r}")
         if norm_position not in ("before_activation", "after_activation"):
             raise ValueError(f"unknown norm_position {norm_position!r}")
+        if pool not in POOLS:
+            raise ValueError(f"pool must be one of {POOLS}, not {pool!r}")
         self.negative_slope = negative_slope
-        self.encoder, self.norm_position = encoder, norm_position
+        self.encoder, self.norm_position, self.pool = encoder, norm_position, pool
+        self.steps, self.features_per_step = 1, input_dim
         self.convs, self.norms = nn.ModuleList(), nn.ModuleList()
+        self.snapshot, self.tconvs, self.tnorms = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
+        self.attention = None
         width = input_dim
-        if encoder == "conv":
+
+        if encoder in SEQUENCE_ENCODERS:
+            if steps < 1:
+                raise ValueError(f"steps must be at least 1, got {steps}")
+            if input_dim % steps:
+                raise ValueError(
+                    f"encoder={encoder!r} reads the input as {steps} snapshots, but {input_dim} "
+                    f"features do not divide by {steps}. Pass steps=trajl, and note that "
+                    "features.append_com appends its columns after all the snapshot blocks, "
+                    "which breaks the layout these encoders rely on.")
+            self.steps = steps
+            self.features_per_step = nf = input_dim // steps
+            if encoder == "snapshot_shared":
+                w = nf
+                for u in snapshot_hidden:
+                    self.snapshot.append(nn.Linear(w, u))
+                    w = u
+            else:
+                channels = nf
+                for f in temporal_filters:
+                    self.tconvs.append(nn.Conv1d(channels, f, kernel_size=temporal_kernel,
+                                                 padding=temporal_kernel // 2, bias=conv_bias))
+                    self.tnorms.append(KerasBatchNorm1d(f))
+                    channels = f
+                w = channels
+            width = w * steps if pool == "concat" else w     # mean/attention/last keep one step's width
+            if pool == "attention":
+                self.attention = nn.Linear(w, 1)
+        elif encoder == "conv":
             channels, length = 1, input_dim
             for f in conv_filters:
                 self.convs.append(nn.Conv1d(channels, f, kernel_size=3, padding=1, bias=conv_bias))
                 self.norms.append(KerasBatchNorm1d(f))
                 channels, length = f, length // 2
             width = channels * length
+
         self.denses = nn.ModuleList()
         for u in dense_units:
             self.denses.append(nn.Linear(width, u))
             width = u
         self.out = nn.Linear(width, out_features)
         self.drop = nn.Dropout(dropout)
-        # As in the notebook: regulariser k % len(regs) for the k-th conv, and again
-        # from the start for the dense layers (conv1 l2, conv2 l1, dense1 l2, dense2 l1).
-        # An empty tuple means no penalty at all.
+        # As in the notebook: regulariser k % len(regs) for the k-th encoder layer, and
+        # again from the start for the dense layers (conv1 l2, conv2 l1, dense1 l2,
+        # dense2 l1). An empty tuple means no penalty at all.
         regs = list(regularizers)
+        encoder_layers = list(self.convs) + list(self.snapshot) + list(self.tconvs)
         self._penalties = ([] if not regs else
-                           [(c, regs[i % len(regs)]) for i, c in enumerate(self.convs)]
+                           [(c, regs[i % len(regs)]) for i, c in enumerate(encoder_layers)]
                            + [(d, regs[i % len(regs)]) for i, d in enumerate(self.denses)])
-        for m in list(self.convs) + list(self.denses) + [self.out]:
+        for m in encoder_layers + list(self.denses) + [self.out] + (
+                [self.attention] if self.attention is not None else []):
             nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
+    def _per_step(self, x: torch.Tensor) -> torch.Tensor:
+        """(N, steps * nf) -> (N, steps, width): one representation per snapshot."""
+        x = x.reshape(x.shape[0], self.steps, self.features_per_step)
+        if self.encoder == "snapshot_shared":
+            # nn.Linear acts on the last axis, so every snapshot goes through the
+            # same weights: sharing along time, not a separate net per snapshot.
+            for lin in self.snapshot:
+                x = self.drop(F.leaky_relu(lin(x), self.negative_slope))
+            return x
+        x = x.transpose(1, 2)                                      # (N, nf, steps): nf = channels
+        for conv, norm in zip(self.tconvs, self.tnorms):
+            if self.norm_position == "after_activation":
+                x = norm(F.leaky_relu(conv(x), self.negative_slope))
+            else:
+                x = F.leaky_relu(norm(conv(x)), self.negative_slope)
+            x = self.drop(x)
+        return x.transpose(1, 2)                                   # (N, steps, filters)
+
+    def _pool(self, x: torch.Tensor) -> torch.Tensor:
+        if self.pool == "concat":
+            return x.reshape(x.shape[0], -1)
+        if self.pool == "mean":
+            return x.mean(dim=1)
+        if self.pool == "last":
+            return x[:, -1]                                         # the snapshot the label is for
+        weights = torch.softmax(self.attention(x), dim=1)           # (N, steps, 1)
+        return (x * weights).sum(dim=1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.encoder == "conv":
+        if self.encoder in SEQUENCE_ENCODERS:
+            x = self._pool(self._per_step(x))
+        elif self.encoder == "conv":
             x = x.unsqueeze(1)                                     # (N, 1, d)
             for conv, norm in zip(self.convs, self.norms):
                 if self.norm_position == "after_activation":

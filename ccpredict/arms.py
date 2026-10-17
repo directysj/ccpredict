@@ -86,6 +86,7 @@ class SplitContext:
     classifier_cfg: ClassifierConfig
     regressor_cfg: RegressorConfig
     net_cfg: NetConfig = field(default_factory=NetConfig)
+    trajl: int = 1                 # snapshots per row; the sequence encoders need it
     cache: dict = field(default_factory=dict)
 
     def X_train(self, feature_set: str) -> np.ndarray:
@@ -208,13 +209,16 @@ class PublishedArm(Arm):
 
     feature_sets = ("vae",)
 
-    def __init__(self, fit_on: str, validation: str = "keras_tail"):
-        if fit_on not in ("test", "train_crossfit"):
+    def __init__(self, fit_on: str, validation: str = "keras_tail", encoder: Optional[str] = None):
+        if fit_on not in ("test", "train_crossfit", "train_holdout"):
             raise ValueError(fit_on)
-        self.fit_on, self.validation = fit_on, validation
-        self.name = {"test": "published_insample", "train_crossfit": "published_crossfit"}[fit_on]
+        self.fit_on, self.validation, self.encoder = fit_on, validation, encoder
+        self.name = {"test": "published_insample", "train_crossfit": "published_crossfit",
+                     "train_holdout": "published_holdout"}[fit_on]
         if validation != "keras_tail":
             self.name += "_groupedval"
+        if encoder is not None:
+            self.name += f"_{encoder}"
 
     def _scaled(self, ctx):
         return scaled_vae_features(ctx)
@@ -222,18 +226,38 @@ class PublishedArm(Arm):
     def _clf_cfg(self, ctx) -> ClassifierConfig:
         cfg = copy.deepcopy(ctx.classifier_cfg)
         cfg.validation = self.validation
+        if self.encoder is not None:
+            cfg.encoder = self.encoder
         return cfg
+
+    def _rows_for_stage1(self, ctx):
+        """(stage-1 rows, stage-2 rows): all rows, unless fit_on='train_holdout'."""
+        from .models import stage2_split
+
+        if self.fit_on != "train_holdout":
+            return None, None
+        cfg = ctx.regressor_cfg
+        return stage2_split(ctx.train.groups, cfg.stage2_fraction, cfg.stage2_seed)
 
     def _classifier(self, ctx):
         from .models import StageOneClassifier
 
-        key = ("clf", self.validation)
+        s1, _ = self._rows_for_stage1(ctx)
+        # The holdout mode trains on fewer rows, so it cannot share a classifier
+        # with the arms that train on all of them.
+        key = ("clf", self.validation, self.encoder,
+               None if s1 is None else (ctx.regressor_cfg.stage2_fraction,
+                                        ctx.regressor_cfg.stage2_seed))
         if key not in ctx.cache:
             Xs, _ = self._scaled(ctx)
             cfg = self._clf_cfg(ctx)
             y_class = discretize(ctx.train.y, cfg.class_boundaries)
+            groups = ctx.train.groups
+            if s1 is not None:
+                Xs, y_class, groups = Xs[s1], y_class[s1], groups[s1]
             t0 = time.time()
-            clf = StageOneClassifier(cfg, len(cfg.class_boundaries) + 1).fit(Xs, y_class, ctx.train.groups)
+            clf = StageOneClassifier(cfg, len(cfg.class_boundaries) + 1, ctx.trajl).fit(
+                Xs, y_class, groups)
             ctx.cache[key] = (clf, time.time() - t0)
         return ctx.cache[key]
 
@@ -246,7 +270,8 @@ class PublishedArm(Arm):
             cfg = self._clf_cfg(ctx)
             y_class = discretize(ctx.train.y, cfg.class_boundaries)
             ctx.cache[key] = out_of_fold_proba(Xs, y_class, ctx.train.fold, cfg,
-                                               len(cfg.class_boundaries) + 1, groups=ctx.train.groups)
+                                               len(cfg.class_boundaries) + 1,
+                                               groups=ctx.train.groups, steps=ctx.trajl)
         return ctx.cache[key]
 
     def run(self, ctx):
@@ -266,11 +291,21 @@ class PublishedArm(Arm):
                 Z = stack_features(Xs_test[f], proba[f])
                 reg = StageTwoRegressor(ctx.regressor_cfg).fit(Z, b.y)
                 out[f] = ArmResult(reg.predict(Z), proba[f], dict(info, n_features=reg.n_features_used))
+            return out
+
+        if self.fit_on == "train_holdout":
+            # Stage 1 never saw these rows, so its probabilities on them are as
+            # (un)confident as the ones stage 2 will meet on a new FOV.
+            _, s2 = self._rows_for_stage1(ctx)
+            X_fit = stack_features(Xs_train[s2], clf.predict_proba(Xs_train[s2]))
+            y_fit = ctx.train.y[s2]
+            info["stage2_rows"] = int(s2.size)
         else:
-            reg = StageTwoRegressor(ctx.regressor_cfg).fit(stack_features(Xs_train, self._oof(ctx)), ctx.train.y)
-            for f in ctx.tests:
-                out[f] = ArmResult(reg.predict(stack_features(Xs_test[f], proba[f])), proba[f],
-                                   dict(info, n_features=reg.n_features_used))
+            X_fit, y_fit = stack_features(Xs_train, self._oof(ctx)), ctx.train.y
+        reg = StageTwoRegressor(ctx.regressor_cfg).fit(X_fit, y_fit)
+        for f in ctx.tests:
+            out[f] = ArmResult(reg.predict(stack_features(Xs_test[f], proba[f])), proba[f],
+                               dict(info, n_features=reg.n_features_used))
         return out
 
 
@@ -306,7 +341,7 @@ class NeuralArm(Arm):
         Xs_train, Xs_test = scaled_vae_features(ctx)
         cfg = self.cfg(ctx)
         t0 = time.time()
-        model = DirectRegressor(cfg).fit(Xs_train, ctx.train.y, ctx.train.groups)
+        model = DirectRegressor(cfg, ctx.trajl).fit(Xs_train, ctx.train.y, ctx.train.groups)
         info = {"net_epochs": len(model.history.get("loss", [])),
                 "net_best_epoch": int(model.history["best_epoch"][0]),
                 "net_seconds": round(time.time() - t0, 1),
@@ -314,7 +349,65 @@ class NeuralArm(Arm):
         return {f: ArmResult(model.predict(Xs_test[f]), info=dict(info)) for f in ctx.tests}
 
 
+class ClassifierArm(Arm):
+    """Stage 1 alone, for comparing encoders on the classification task.
+
+    One classifier fit, no forest, so a run costs a fraction of a published_*
+    arm. Early stopping holds out whole trajectories by default (the notebook's
+    oversampled tail is a defect, and comparing architectures through it would
+    mostly compare their luck on duplicated rows).
+
+    The benchmark scores regressions, so y_pred is the probability-weighted class
+    mean, sum_k p_k * mean(y in class k) with the means taken from the training
+    labels. That makes the classifier directly comparable with the regression
+    arms, and the classification metrics (accuracy, balanced accuracy, macro F1)
+    are reported next to it from the same probabilities.
+    """
+
+    feature_sets = ("vae",)
+
+    def __init__(self, encoder: str, validation: str = "grouped_holdout"):
+        self.encoder, self.validation = encoder, validation
+        self.name = f"clf_{encoder}"
+
+    def cfg(self, ctx) -> ClassifierConfig:
+        cfg = copy.deepcopy(ctx.classifier_cfg)
+        cfg.encoder, cfg.validation = self.encoder, self.validation
+        return cfg
+
+    def run(self, ctx):
+        from .models import StageOneClassifier
+
+        Xs_train, Xs_test = scaled_vae_features(ctx)
+        cfg = self.cfg(ctx)
+        num_classes = len(cfg.class_boundaries) + 1
+        y_class = discretize(ctx.train.y, cfg.class_boundaries)
+        centers = np.array([ctx.train.y[y_class == k].mean() if np.any(y_class == k)
+                            else np.nan for k in range(num_classes)])
+        if np.isnan(centers).any():                 # a class absent from training
+            centers = np.where(np.isnan(centers), ctx.train.y.mean(), centers)
+
+        t0 = time.time()
+        clf = StageOneClassifier(cfg, num_classes, ctx.trajl).fit(Xs_train, y_class, ctx.train.groups)
+        info = {"classifier_epochs": len(clf.history.get("loss", [])),
+                "classifier_seconds": round(time.time() - t0, 1),
+                "clf_encoder": cfg.encoder, "clf_validation": cfg.validation,
+                "n_parameters": sum(p.numel() for p in clf.model.parameters()),
+                "class_means": centers.round(4).tolist()}
+        if clf.history.get("best_epoch"):
+            info["classifier_best_epoch"] = int(clf.history["best_epoch"][0])
+
+        out = {}
+        for f in ctx.tests:
+            proba = clf.predict_proba(Xs_test[f])
+            out[f] = ArmResult(proba @ centers, proba, dict(info))
+        return out
+
+
 NOTEBOOK_REGULARIZERS = (("l2", 0.01), ("l1", 0.02))
+
+# Encoders compared by the clf_* arms; see cnn.FeedForwardNet for what each does.
+CLASSIFIER_ENCODERS = ("conv", "mlp", "snapshot_shared", "temporal_conv")
 
 
 # ----------------------------------------------------------------------------
@@ -330,6 +423,13 @@ NEURAL_ARMS: Dict[str, dict] = {
     "nn_mlp_weighted": {"label_weighting": "inverse_density"},
     # Fix 2: the architecture. Does the convolution along the latent index earn its cost?
     "nn_conv": {"encoder": "conv"},
+    # Sequence encoders on the (trajl x nf) layout, regression only: no class bins,
+    # no forest. "last" pooling reads out the snapshot the label belongs to.
+    "nn_tconv": {"encoder": "temporal_conv", "pool": "last"},
+    "nn_tconv_concat": {"encoder": "temporal_conv", "pool": "concat"},
+    "nn_tconv_hist": {"encoder": "temporal_conv", "pool": "last", "head": "histogram"},
+    "nn_snapshot": {"encoder": "snapshot_shared", "pool": "last"},
+    "nn_snapshot_hist": {"encoder": "snapshot_shared", "pool": "last", "head": "histogram"},
     # Ablations of the notebook's two choices, one at a time.
     "nn_conv_notebook_bn": {"encoder": "conv", "norm_position": "after_activation",
                             "conv_bias": True},
@@ -345,7 +445,11 @@ ARMS: Dict[str, Callable[[], Arm]] = {
     "published_insample": lambda: PublishedArm("test", "keras_tail"),
     "published_crossfit": lambda: PublishedArm("train_crossfit", "keras_tail"),
     "published_crossfit_groupedval": lambda: PublishedArm("train_crossfit", "grouped_holdout"),
+    "published_holdout": lambda: PublishedArm("train_holdout", "keras_tail"),
+    "published_holdout_groupedval": lambda: PublishedArm("train_holdout", "grouped_holdout"),
     **{name: (lambda n=name, o=over: NeuralArm(n, **o)) for name, over in NEURAL_ARMS.items()},
+    # Stage 1 alone, one arm per encoder: which architecture classifies best.
+    **{f"clf_{enc}": (lambda e=enc: ClassifierArm(e)) for enc in CLASSIFIER_ENCODERS},
 }
 
 DEFAULT_ARMS: List[str] = list(ARMS)

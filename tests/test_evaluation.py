@@ -299,6 +299,178 @@ def test_fit_runs_on_an_accelerator_when_present(device):
         assert np.all(np.isfinite(m.predict(X)))
 
 
+# ------------------------------------------------- sequence encoders (trajl > 1)
+def _sequence_net(encoder, steps=8, nf=16, out=3, **kw):
+    from ccpredict.cnn import FeedForwardNet
+
+    return FeedForwardNet(steps * nf, out, encoder=encoder, steps=steps, dropout=0.0,
+                          snapshot_hidden=(8,), temporal_filters=(8, 8), **kw)
+
+
+@pytest.mark.parametrize("encoder", ["snapshot_shared", "temporal_conv"])
+def test_sequence_encoders_read_the_input_as_snapshots(encoder):
+    """The row is [snapshot 0 features | snapshot 1 features | ...]; these encoders
+    must recover that (steps, nf) block layout, which is what the notebook's
+    flat convolution does not."""
+    torch = pytest.importorskip("torch")
+
+    net = _sequence_net(encoder)
+    assert net.steps == 8 and net.features_per_step == 16
+    net.eval()
+    with torch.no_grad():
+        per_step = net._per_step(torch.rand(5, 128))
+    assert per_step.shape == (5, 8, 8)                 # (rows, snapshots, width)
+    assert net(torch.rand(5, 128)).shape == (5, 3)
+
+
+def test_snapshot_encoder_shares_weights_across_snapshots():
+    """The same snapshot in a different time slot must get the same representation."""
+    torch = pytest.importorskip("torch")
+
+    net = _sequence_net("snapshot_shared", steps=4, nf=6)
+    net.eval()
+    snapshots = torch.rand(4, 6)
+    with torch.no_grad():
+        a = net._per_step(snapshots.reshape(1, -1))[0]
+        rolled = net._per_step(torch.roll(snapshots, 1, dims=0).reshape(1, -1))[0]
+    assert torch.allclose(a[0], rolled[1], atol=1e-6)
+    assert torch.allclose(a[3], rolled[0], atol=1e-6)
+
+
+def test_last_pooling_reads_out_the_snapshot_the_label_belongs_to():
+    """The N/C ground truth is the last snapshot of the snippet, so pool="last"
+    must return exactly that step's representation."""
+    torch = pytest.importorskip("torch")
+
+    net = _sequence_net("snapshot_shared", steps=4, nf=6, pool="last")
+    net.eval()
+    x = torch.rand(3, 24)
+    with torch.no_grad():
+        per_step = net._per_step(x)
+        assert torch.equal(net._pool(per_step), per_step[:, -1])
+    # Changing an earlier snapshot still matters (the conv mixes neighbours), but
+    # for the shared-MLP encoder the read-out depends only on the last snapshot.
+    y = x.clone()
+    y[:, :6] += 5.0                                      # disturb snapshot 0
+    with torch.no_grad():
+        assert torch.allclose(net(x), net(y), atol=1e-6)
+
+
+@pytest.mark.parametrize("pool,order_sensitive", [("concat", True), ("mean", False),
+                                                  ("attention", False), ("last", True)])
+def test_pooling_keeps_or_discards_the_time_order(pool, order_sensitive):
+    """concat gives the head a weight per snapshot, so reordering changes the output;
+    mean and attention are permutation-invariant by construction."""
+    torch = pytest.importorskip("torch")
+
+    net = _sequence_net("snapshot_shared", steps=4, nf=6, pool=pool)
+    net.eval()
+    snapshots = torch.rand(4, 6)
+    with torch.no_grad():
+        a = net(snapshots.reshape(1, -1))
+        b = net(torch.roll(snapshots, 1, dims=0).reshape(1, -1))
+    assert (not torch.allclose(a, b, atol=1e-5)) == order_sensitive
+
+
+def test_sequence_encoders_are_far_smaller_than_the_flat_conv():
+    """The point of weight sharing: at trajl=8, nf=256 the notebook's flatten feeds
+    32,768 units into dense 128 on its own."""
+    pytest.importorskip("torch")
+    from ccpredict.cnn import FeedForwardNet
+
+    def count(**kw):
+        return sum(p.numel() for p in FeedForwardNet(8 * 256, 3, steps=8, **kw).parameters())
+
+    flat_conv = count(encoder="conv")
+    assert flat_conv > 4_000_000
+    assert count(encoder="snapshot_shared") < flat_conv / 20
+    assert count(encoder="temporal_conv") < flat_conv / 20
+
+
+def test_sequence_encoder_rejects_an_input_that_is_not_whole_snapshots():
+    pytest.importorskip("torch")
+    from ccpredict.cnn import FeedForwardNet
+
+    with pytest.raises(ValueError, match="do not divide"):
+        FeedForwardNet(100, 3, encoder="temporal_conv", steps=8)
+    with pytest.raises(ValueError, match="encoder"):
+        FeedForwardNet(64, 3, encoder="transformer", steps=8)
+
+
+def test_trajl_reaches_the_network_through_the_split_context():
+    """A row of trajl*nf features must arrive at the net as trajl snapshots."""
+    pytest.importorskip("torch")
+    from ccpredict.arms import ClassifierArm, SplitContext
+    from ccpredict.config import ClassifierConfig, NetConfig, RegressorConfig
+    from ccpredict.models import StageOneClassifier, build_cnn_classifier
+
+    cfg = ClassifierConfig(encoder="snapshot_shared")
+    assert build_cnn_classifier(8 * 32, 3, cfg, steps=8).steps == 8
+    assert StageOneClassifier(cfg, 3, steps=8).steps == 8
+    ctx = SplitContext("s", None, {}, lambda f: None, cfg, RegressorConfig(), NetConfig(), trajl=8)
+    assert ctx.trajl == 8
+    assert ClassifierArm("temporal_conv").cfg(ctx).encoder == "temporal_conv"
+
+
+@pytest.mark.parametrize("encoder", ["snapshot_shared", "temporal_conv"])
+def test_classifier_trains_with_a_sequence_encoder(encoder, tmp_path):
+    """End to end on trajl=4 rows, including the save/load roundtrip (the model
+    shape depends on steps, so a checkpoint has to carry it)."""
+    pytest.importorskip("torch")
+    from ccpredict.models import StageOneClassifier
+
+    steps, nf = 4, 8
+    rng = np.random.default_rng(0)
+    y = rng.choice(3, 400, p=[0.1, 0.8, 0.1])
+    X = rng.random((400, steps * nf)) + 0.3 * y[:, None]
+    groups = np.arange(400) // 10
+    cfg = _quick_cfg(encoder=encoder, validation="grouped_holdout")
+    clf = StageOneClassifier(cfg, 3, steps).fit(X, y, groups)
+    proba = clf.predict_proba(X)
+    assert proba.shape == (400, 3) and np.allclose(proba.sum(1), 1, atol=1e-5)
+
+    clf.save(str(tmp_path))
+    loaded = StageOneClassifier.load(str(tmp_path), cfg)
+    assert loaded.steps == steps
+    assert np.array_equal(proba, loaded.predict_proba(X))
+
+
+# ------------------------------------------------- stage-2 holdout
+def test_stage2_split_keeps_whole_trajectories_apart():
+    from ccpredict.models import stage2_split
+
+    groups = np.repeat(np.arange(50), 8)
+    s1, s2 = stage2_split(groups, 0.3, seed=42)
+    assert s1.size + s2.size == groups.size
+    assert not set(groups[s1]) & set(groups[s2])          # no cell in both stages
+    assert 0.2 < s2.size / groups.size < 0.4
+    assert np.array_equal(stage2_split(groups, 0.3, 42)[1], s2)   # deterministic
+    with pytest.raises(ValueError, match="groups"):
+        stage2_split(None, 0.3, 42)
+    with pytest.raises(ValueError, match="stage2_fraction"):
+        stage2_split(groups, 0.0, 42)
+
+
+def test_published_holdout_trains_stage1_on_fewer_rows_than_crossfit():
+    """The holdout arm must not reuse the classifier the other arms trained on all
+    rows, or stage 2 would learn from in-sample probabilities after all."""
+    from ccpredict.arms import PublishedArm, SplitContext
+    from ccpredict.config import ClassifierConfig, NetConfig, RegressorConfig
+
+    rng = np.random.default_rng(0)
+    from ccpredict.arms import Block
+    n = 400
+    train = Block(rng.random((n, 8)), 1 + rng.random(n), np.zeros(n, int),
+                  np.arange(n) // 10, ("A",))
+    ctx = SplitContext("s", train, {}, lambda f: np.arange(8), ClassifierConfig(),
+                       RegressorConfig(), NetConfig(), trajl=1)
+    crossfit, holdout = PublishedArm("train_crossfit"), PublishedArm("train_holdout")
+    assert crossfit._rows_for_stage1(ctx) == (None, None)
+    s1, s2 = holdout._rows_for_stage1(ctx)
+    assert s1.size + s2.size == n and s1.size > s2.size
+    assert holdout.name == "published_holdout"
+
+
 def test_no_regularisers_means_no_penalty():
     """regularizers=() is the natural way to say 'no penalty'; it used to raise
     ZeroDivisionError from the k % len(regs) rule."""
@@ -473,9 +645,13 @@ def test_neural_arms_differ_only_by_their_overrides():
     base = NetConfig()
     for name, overrides in NEURAL_ARMS.items():
         cfg = make_arm(name).cfg(ctx)
+        for key, value in overrides.items():
+            assert getattr(cfg, key) == value, (name, key)      # every override applied
         changed = {f.name for f in dataclasses.fields(cfg)
                    if getattr(cfg, f.name) != getattr(base, f.name)}
-        assert changed == set(overrides), name
+        # Nothing else differs. An override may restate the default (nn_tconv_concat
+        # names the pooling it uses), so this is a subset, not an equality.
+        assert changed <= set(overrides), (name, changed - set(overrides))
     with pytest.raises(KeyError):
         from ccpredict.arms import NeuralArm
 

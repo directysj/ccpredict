@@ -36,7 +36,7 @@ def main(fixture: str, ref_path: str, out_dir: str) -> int:
     class NotebookStageOne:
         """Stand-in for StageOneClassifier that replays the notebook's stage 1."""
 
-        def __init__(self, cfg, num_classes):
+        def __init__(self, cfg, num_classes, steps=1):
             self.history = {"loss": list(ref["history_loss"]), "val_loss": list(ref["history_val_loss"])}
 
         def fit(self, X, y_class, groups=None):
@@ -53,6 +53,8 @@ def main(fixture: str, ref_path: str, out_dir: str) -> int:
     cfg = BenchmarkConfig(scheme="fixed", arms=("published_insample",), run_split_optimism=False,
                           output_dir=out_dir, n_boot=20)
     p = cfg.pipeline
+    # The notebook's label semantics, pinned (the package defaults differ now).
+    p.features.label_frame, p.features.include_last_window = "start_plus_trajl", False
     p.paths.traj_dir, p.paths.vae_dir = fixture, os.path.join(fixture, "o2vae")
     p.paths.reporter_dir, p.paths.celltraj_path = os.path.join(fixture, "reporter"), fixture
     p.classifier.epochs, p.classifier.seed, p.classifier.verbose = 4, 123, 0

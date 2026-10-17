@@ -22,7 +22,8 @@ import numpy as np
 from . import evaluation as ev
 from .config import PipelineConfig
 from .data import PreparedData, prepare_data
-from .models import StageOneClassifier, StageTwoRegressor, out_of_fold_proba, stack_features
+from .models import (StageOneClassifier, StageTwoRegressor, out_of_fold_proba, stack_features,
+                     stage2_split)
 from .preprocessing import TrainTestData, build_train_test, discretize
 
 log = logging.getLogger(__name__)
@@ -104,8 +105,8 @@ class CellCyclePipeline:
         y_test_class = discretize(tt.y_test, cfg.class_boundaries)
 
         if classifier is None:
-            classifier = StageOneClassifier(cfg, num_classes).fit(tt.X_train, y_train_class,
-                                                                  groups=tt.train_groups)
+            classifier = StageOneClassifier(cfg, num_classes, self.config.features.trajl).fit(
+                tt.X_train, y_train_class, groups=tt.train_groups)
         proba = classifier.predict_proba(tt.X_test)
         predicted = np.argmax(proba, axis=1)
         metrics = ev.classification_metrics(y_test_class, predicted, num_classes)
@@ -134,8 +135,26 @@ class CellCyclePipeline:
             clf_cfg = self.config.classifier
             y_class = discretize(tt.y_train, clf_cfg.class_boundaries)
             oof = out_of_fold_proba(tt.X_train, y_class, tt.train_fold, clf_cfg,
-                                    len(clf_cfg.class_boundaries) + 1, groups=tt.train_groups)
+                                    len(clf_cfg.class_boundaries) + 1, groups=tt.train_groups,
+                                    steps=self.config.features.trajl)
             X_fit, y_fit = stack_features(tt.X_train, oof), tt.y_train
+        elif cfg.fit_on == "train_holdout":
+            # The classifier passed in was trained on all training rows, so its
+            # probabilities on them are in-sample; refit stage 1 on the stage-1
+            # part alone and let stage 2 learn from out-of-sample probabilities.
+            clf_cfg = self.config.classifier
+            s1, s2 = stage2_split(tt.train_groups, cfg.stage2_fraction, cfg.stage2_seed)
+            log.info("stage-2 holdout: stage 1 on %d rows, stage 2 on %d held-out rows",
+                     s1.size, s2.size)
+            y_class = discretize(tt.y_train, clf_cfg.class_boundaries)
+            stage1 = StageOneClassifier(clf_cfg, len(clf_cfg.class_boundaries) + 1,
+                                        self.config.features.trajl).fit(
+                tt.X_train[s1], y_class[s1],
+                groups=None if tt.train_groups is None else tt.train_groups[s1])
+            X_fit = stack_features(tt.X_train[s2], stage1.predict_proba(tt.X_train[s2]))
+            y_fit = tt.y_train[s2]
+            # Score the test FOV with the same stage 1 that stage 2 was built on.
+            X_eval = stack_features(tt.X_test, stage1.predict_proba(tt.X_test))
         else:
             raise ValueError(f"unknown fit_on {cfg.fit_on!r}")
 

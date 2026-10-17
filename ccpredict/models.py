@@ -26,25 +26,32 @@ log = logging.getLogger(__name__)
 # Stage 1 (PyTorch; network and training loop in cnn.py)
 # ----------------------------------------------------------------------------
 
-def build_cnn_classifier(input_dim: int, num_classes: int, cfg: ClassifierConfig):
-    """The notebook's create_model as a PyTorch module (see cnn.py for the Keras equivalences).
+def build_cnn_classifier(input_dim: int, num_classes: int, cfg: ClassifierConfig,
+                         steps: int = 1):
+    """Stage 1 as a PyTorch module (see cnn.FeedForwardNet for every Keras equivalence).
 
-    Input (d,) is treated as a length-d sequence, so the (3,)-kernel convolution
-    runs along the feature index. For VAE latents that index has no ordering,
-    so "neighbouring" dimensions are arbitrary.
+    With cfg.encoder="conv" (the notebook) the input (d,) is treated as a
+    length-d sequence, so the (3,)-kernel convolution runs along the feature
+    index; for VAE latents that index has no ordering, so "neighbouring"
+    dimensions are arbitrary. ``steps`` is the snippet length (trajl), used by
+    the encoders that read the input as a sequence of snapshots.
     """
     from .cnn import FeedForwardNet
 
     return FeedForwardNet(input_dim, num_classes, cfg.conv_filters, cfg.dense_units,
-                          cfg.dropout, cfg.regularizers)
+                          cfg.dropout, cfg.regularizers, encoder=cfg.encoder, steps=steps,
+                          snapshot_hidden=cfg.snapshot_hidden,
+                          temporal_filters=cfg.temporal_filters,
+                          temporal_kernel=cfg.temporal_kernel, pool=cfg.pool)
 
 
 class StageOneClassifier:
     """Oversample, train the CNN+DNN with early stopping, predict class probabilities."""
 
-    def __init__(self, cfg: ClassifierConfig, num_classes: int):
+    def __init__(self, cfg: ClassifierConfig, num_classes: int, steps: int = 1):
         self.cfg = cfg
         self.num_classes = num_classes
+        self.steps = steps          # snippet length (trajl); only the sequence encoders use it
         self.model = None
         self.device = None
         self._fitted_input_dim: Optional[int] = None
@@ -100,7 +107,7 @@ class StageOneClassifier:
             raise ValueError(f"unknown validation {cfg.validation!r}")
 
         self._fitted_input_dim = int(X.shape[1])
-        self.model = build_cnn_classifier(X.shape[1], self.num_classes, cfg)
+        self.model = build_cnn_classifier(X.shape[1], self.num_classes, cfg, self.steps)
         self.history = train(self.model, X_tr, y_tr, X_val, y_val, epochs=cfg.epochs,
                              batch_size=cfg.batch_size, learning_rate=cfg.learning_rate,
                              patience=cfg.patience, min_delta=cfg.min_delta, device=self.device,
@@ -122,9 +129,11 @@ class StageOneClassifier:
 
         os.makedirs(directory, exist_ok=True)
         torch.save({"state_dict": self.model.state_dict(), "input_dim": self._fitted_input_dim,
-                    "num_classes": self.num_classes}, os.path.join(directory, "stage1_classifier.pt"))
+                    "num_classes": self.num_classes, "steps": self.steps},
+                   os.path.join(directory, "stage1_classifier.pt"))
         with open(os.path.join(directory, "stage1_history.json"), "w") as fh:
-            json.dump({"num_classes": self.num_classes, "history": self.history}, fh, indent=2)
+            json.dump({"num_classes": self.num_classes, "steps": self.steps,
+                       "history": self.history}, fh, indent=2)
 
     @classmethod
     def load(cls, directory: str, cfg: ClassifierConfig) -> "StageOneClassifier":
@@ -132,10 +141,11 @@ class StageOneClassifier:
 
         with open(os.path.join(directory, "stage1_history.json")) as fh:
             meta = json.load(fh)
-        obj = cls(cfg, meta["num_classes"])
+        obj = cls(cfg, meta["num_classes"], meta.get("steps", 1))
         obj._configure_device()
         ckpt = torch.load(os.path.join(directory, "stage1_classifier.pt"), map_location=obj.device)
-        obj.model = build_cnn_classifier(ckpt["input_dim"], meta["num_classes"], cfg).to(obj.device)
+        obj.model = build_cnn_classifier(ckpt["input_dim"], meta["num_classes"], cfg,
+                                         ckpt.get("steps", 1)).to(obj.device)
         obj.model.load_state_dict(ckpt["state_dict"])
         obj._fitted_input_dim = ckpt["input_dim"]
         obj.history = meta["history"]
@@ -146,12 +156,15 @@ class StageOneClassifier:
 # One-stage neural regressor (not in the notebook; see NetConfig)
 # ----------------------------------------------------------------------------
 
-def build_net(input_dim: int, out_features: int, cfg: NetConfig):
+def build_net(input_dim: int, out_features: int, cfg: NetConfig, steps: int = 1):
     from .cnn import FeedForwardNet
 
     return FeedForwardNet(input_dim, out_features, cfg.conv_filters, cfg.dense_units,
                           cfg.dropout, cfg.regularizers, encoder=cfg.encoder,
-                          norm_position=cfg.norm_position, conv_bias=cfg.conv_bias)
+                          norm_position=cfg.norm_position, conv_bias=cfg.conv_bias,
+                          steps=steps, snapshot_hidden=cfg.snapshot_hidden,
+                          temporal_filters=cfg.temporal_filters,
+                          temporal_kernel=cfg.temporal_kernel, pool=cfg.pool)
 
 
 class DirectRegressor:
@@ -164,8 +177,9 @@ class DirectRegressor:
     drifting towards the mean.
     """
 
-    def __init__(self, cfg: NetConfig):
+    def __init__(self, cfg: NetConfig, steps: int = 1):
         self.cfg = cfg
+        self.steps = steps          # snippet length (trajl); only the sequence encoders use it
         self.model = None
         self.device = None
         self.objective = None
@@ -225,7 +239,7 @@ class DirectRegressor:
             raise ValueError(f"unknown label_weighting {cfg.label_weighting!r}")
 
         self._fitted_input_dim = int(X.shape[1])
-        self.model = build_net(X.shape[1], self.objective.out_features, cfg)
+        self.model = build_net(X.shape[1], self.objective.out_features, cfg, self.steps)
         if cfg.head == "regression":
             with torch.no_grad():
                 self.model.out.bias.fill_(float(np.mean(t_tr)))
@@ -252,13 +266,14 @@ class DirectRegressor:
 
         os.makedirs(directory, exist_ok=True)
         state = {"state_dict": self.model.state_dict(), "input_dim": self._fitted_input_dim,
-                 "out_features": self.objective.out_features}
+                 "out_features": self.objective.out_features, "steps": self.steps}
         if isinstance(self.objective, HistogramObjective):
             state["edges"] = self.objective.edges
             state["centers"] = self.objective.centers
         torch.save(state, os.path.join(directory, "direct_regressor.pt"))
         with open(os.path.join(directory, "direct_regressor_history.json"), "w") as fh:
-            json.dump({"config": dataclasses.asdict(self.cfg), "history": self.history}, fh, indent=2)
+            json.dump({"config": dataclasses.asdict(self.cfg), "steps": self.steps,
+                       "history": self.history}, fh, indent=2)
 
     @classmethod
     def load(cls, directory: str, cfg: Optional[NetConfig] = None) -> "DirectRegressor":
@@ -269,7 +284,8 @@ class DirectRegressor:
 
         with open(os.path.join(directory, "direct_regressor_history.json")) as fh:
             meta = json.load(fh)
-        obj = cls(cfg if cfg is not None else _from_dict(NetConfig, meta["config"]))
+        obj = cls(cfg if cfg is not None else _from_dict(NetConfig, meta["config"]),
+                  meta.get("steps", 1))
         obj.device = select_device(obj.cfg.device, obj.cfg.num_threads)
         ckpt = torch.load(os.path.join(directory, "direct_regressor.pt"), map_location=obj.device,
                           weights_only=False)
@@ -279,7 +295,9 @@ class DirectRegressor:
             obj.objective = HistogramObjective(ckpt["edges"], ckpt["centers"])
         else:
             obj.objective = obj._objective(np.zeros(1))
-        obj.model = build_net(ckpt["input_dim"], ckpt["out_features"], obj.cfg).to(obj.device)
+        obj.steps = ckpt.get("steps", obj.steps)
+        obj.model = build_net(ckpt["input_dim"], ckpt["out_features"], obj.cfg,
+                              obj.steps).to(obj.device)
         obj.model.load_state_dict(ckpt["state_dict"])
         obj._fitted_input_dim = ckpt["input_dim"]
         obj.history = meta["history"]
@@ -288,7 +306,7 @@ class DirectRegressor:
 
 def out_of_fold_proba(X: np.ndarray, y_class: np.ndarray, folds: np.ndarray,
                       cfg: ClassifierConfig, num_classes: int,
-                      groups: Optional[np.ndarray] = None) -> np.ndarray:
+                      groups: Optional[np.ndarray] = None, steps: int = 1) -> np.ndarray:
     """Class probabilities for every row from a classifier that never saw that row's fold.
 
     With folds = FOV of each training row this is leave-one-FOV-out
@@ -299,7 +317,7 @@ def out_of_fold_proba(X: np.ndarray, y_class: np.ndarray, folds: np.ndarray,
     for k in np.unique(folds):
         held = folds == k
         log.info("out-of-fold classifier: holding out fold %s (%d rows)", k, held.sum())
-        clf = StageOneClassifier(cfg, num_classes).fit(
+        clf = StageOneClassifier(cfg, num_classes, steps).fit(
             X[~held], y_class[~held], None if groups is None else groups[~held])
         proba[held] = clf.predict_proba(X[held])
     return proba
@@ -312,6 +330,23 @@ def out_of_fold_proba(X: np.ndarray, y_class: np.ndarray, folds: np.ndarray,
 def stack_features(X: np.ndarray, class_proba: np.ndarray) -> np.ndarray:
     """[scaled features | stage-1 class probabilities] (In [42])."""
     return np.concatenate((X, class_proba), axis=1)
+
+
+def stage2_split(groups: np.ndarray, fraction: float, seed: int):
+    """Split rows into (stage 1, stage 2) by whole trajectories.
+
+    For fit_on="train_holdout": stage 1 trains on the first part, stage 2 on the
+    second, so the probabilities stage 2 learns from are out-of-sample for stage 1
+    and no cell contributes to both stages.
+    """
+    from sklearn.model_selection import GroupShuffleSplit
+
+    if groups is None:
+        raise ValueError("fit_on='train_holdout' needs groups (trajectory ids per row)")
+    if not 0 < fraction < 1:
+        raise ValueError(f"stage2_fraction must be strictly between 0 and 1, got {fraction}")
+    return next(GroupShuffleSplit(n_splits=1, test_size=fraction,
+                                  random_state=seed).split(np.zeros(len(groups)), None, groups))
 
 
 class StageTwoRegressor:

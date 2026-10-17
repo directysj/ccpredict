@@ -269,7 +269,7 @@ def run_benchmark(cfg: BenchmarkConfig) -> dict:
         _write_json(os.path.join(cfg.output_dir, "diagnostics.json"), diagnostics)
 
         ctx = SplitContext(split_name, train, tests, columns, clf_cfg, cfg.pipeline.regressor,
-                           net_cfg)
+                           net_cfg, trajl=meta["trajl"])
         for arm_name in cfg.arms:
             arm = make_arm(arm_name)
             log.info("[%s] arm %s", split_name, arm_name)
