@@ -9,21 +9,6 @@ Two published stages: a CNN classifying N/C into 3 bins, then an RFECV random fo
 [features | class probabilities]. `ccpredict/` reproduces that exactly; the benchmark
 compares it with baselines, with honest protocols, and with one-stage alternatives.
 
-## Ground rules
-
-- **Never commit or push unless asked.** Leave changes in the working tree for review.
-- **Defaults reproduce the notebook, defects included.** Every defect that changes numbers
-  gets an off-by-default switch and a `NOTEBOOK DEFECT` comment. Never silently fix one.
-- **No access to the real data.** Everything is validated on `ccpredict/simulate.py`. Say
-  "on the simulator" rather than implying a result transfers to real cells.
-- **Don't claim a gain smaller than the seed spread** (~0.01 R for the `nn_*` arms). Run
-  `tests/seed_spread.py` before ranking two arms.
-- **Nothing is scored on rows it was fitted on**, except the arms whose names say
-  `_insample` (they exist to measure that effect).
-- Device default is `"cpu"` (this Mac). Switch to `"auto"` only at handover to the
-  Zuckerman-lab HPC.
-- Blunt mechanistic critique over diplomatic summary.
-
 ## Layout
 
 | path | what |
@@ -43,7 +28,7 @@ whoever has the real data, `results/simulator_tweaks.md` has the measurements be
 
 ## Environment
 
-Conda env `torch_290` (torch 2.9, Python 3.12) on this Mac. `pip install -e .` then
+Conda env `torch_290` (torch 2.9, Python 3.12) on my Mac. `pip install -e .` then
 `pytest tests/`: 64 passed with TensorFlow present, 57 passed + 1 skipped without it
 (the Keras parity file skips itself). TensorFlow is only needed for `tests/parity`;
 install it with `pip install -e .[parity]`.
@@ -51,7 +36,7 @@ install it with `pip install -e .[parity]`.
 ## State
 
 Branch `ccp_torch`. Stage 1 was ported from Keras to PyTorch and the one-stage `nn_*`
-arms were added. Changes are uncommitted on purpose.
+arms were added.
 
 ## What has been measured (simulator, EGF1 -> EGF2, Pearson R)
 
@@ -96,9 +81,6 @@ against 0.510 / 0.531 / 0.539 published), so its difficulty is about right.
 
 ## Open
 
-- Fix 3 from the earlier list is not done: use the trajectory. `trajl=1` throws away the
-  time axis, and N/C is smooth in time, so a sequence model over the snippet is the
-  remaining idea with a mechanism behind it.
 - Handover: `RUNNING.md` tells whoever has the real data what to run. The one addition
   worth insisting on is a second run with `label_frame: "snippet_end"`.
 - Before handover, switch `classifier.device` and `net.device` to `"auto"`.

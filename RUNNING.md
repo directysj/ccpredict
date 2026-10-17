@@ -1,6 +1,6 @@
 # Running the benchmark on the real data
 
-This is for whoever has access to the LI204601 files. It compares the model
+This is to run on LI204601 files. It compares the model
 published in the preprint (VAE features + CNN class probabilities + RFECV
 random forest) with baselines and with honest versions of the same model, all
 on the same rows. Your run produces a results folder; send that back.
@@ -78,14 +78,12 @@ Expect most of a day on one CPU node. To cut it:
   `--arms published_crossfit_groupedval`; the `nn_*` arms are minutes each and
   can go in the fast job.
 
-If you change any setting, keep it the same across all arms and say so when you
-send results back.
+If you change any setting, keep it the same across all arms.
 
-## 5. What to send back
+## 5. About results directory
 
-Send the `results/` folder **without `cache/`** (it holds the features).
-`predictions/` holds per-cell predicted and measured N/C; include it if that is
-fine for you, otherwise leave it out. `report.md` alone already answers the
+The `results/` folder **without `cache/`** (it holds the features).
+`predictions/` holds per-cell predicted and measured N/C. `report.md` alone already answers the
 main questions.
 
 ## What the arms are
@@ -130,7 +128,7 @@ python -m ccpredict.benchmark --config bench_labelfix.json --output-dir results_
     --arms constant,lasso_vae,rf_vae,nn_mlp,nn_mlp_hist
 ```
 
-Send both folders. Features are prepared again for this one (different labels),
+Features are prepared again for this one (different labels),
 so it costs one data load on top of the arms.
 
 The key comparisons: `published_insample` vs `published_crossfit` (is the
