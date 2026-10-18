@@ -4,7 +4,7 @@ Predicts the cell-cycle reporter readout (nucleus/cytoplasm ratio, N/C) of singl
 cells from O2VAE morphology embeddings along their tracked trajectories. It is a
 package version of `vaeFeatCCinfoABwells-NNclfRFreg.ipynb`.
 
-Two stages:
+The published model has two stages:
 1. **Stage 1:** a CNN+DNN classifies the N/C ratio into bins (default `<0.9`, `0.9–2.7`, `≥2.7`).
 2. **Stage 2:** a random forest with RFECV regresses the N/C ratio from the
    scaled features plus the stage-1 class probabilities.
@@ -12,6 +12,31 @@ Two stages:
 With default settings the package reproduces the notebook exactly, defects
 included. Each defect that changes numbers has an off-by-default switch,
 listed below.
+
+## This branch: `ccp_torch_reg`
+
+**One-stage regression.** The two-stage model forces the N/C ratio through three
+hard class boundaries and then regresses from the class probabilities; this
+branch asks what happens when a single network predicts the ratio directly, with
+no bins and no forest. The two-stage path is still here, reproduced exactly, and
+`published_crossfit` stays in the default run as the reference to beat — but the
+`nn_*` arms are what the branch is about.
+
+Two defaults are flipped here, because the ground truth N/C belongs to the **last
+snapshot of the snippet** and the notebook's settings do not reflect that:
+
+| setting | notebook / `ccp_torch` | here | why |
+|---|---|---|---|
+| `features.label_frame` | `"start_plus_trajl"` | `"snippet_end"` | the notebook reads the label one frame *past* the snippet |
+| `features.include_last_window` | `false` | `true` | the tracker's own `get_traj_segments` includes it (`range(traj_len - seg_length + 1)`) |
+
+Both are worth 0.03–0.05 R on the simulator, and `tests/parity/*` pin the old
+values explicitly so notebook parity still means parity.
+
+`DEFAULT_ARMS` (in `arms.py`) is a regression-focused subset, not every
+registered arm — at `trajl=8` running them all is hours. The protocol
+ablations, the `clf_*` classification arms and the loss ablations stay
+registered and run by name with `--arms`.
 
 ## Install and run
 

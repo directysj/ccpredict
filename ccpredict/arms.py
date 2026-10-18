@@ -482,7 +482,33 @@ ARMS: Dict[str, Callable[[], Arm]] = {
     **{f"clf_{enc}": (lambda e=enc: ClassifierArm(e)) for enc in CLASSIFIER_ENCODERS},
 }
 
-DEFAULT_ARMS: List[str] = list(ARMS)
+# Branch ccp_torch_reg predicts N/C with one network: no class bins, no forest.
+# The default run is the cheap reference baselines, one honest two-stage
+# reference to compare against (published_crossfit), and the one-stage arms.
+#
+# Deliberately NOT in the default, though all remain registered and runnable by
+# name (--arms published_insample,clf_transformer,...):
+#   published_insample / _crossfit_groupedval / _holdout / _holdout_groupedval
+#       protocol ablations of the two-stage model; the point they make is made
+#       in results/simulator_tweaks.md and each costs an RFECV fit.
+#   rf_vae_insample      the in-sample demonstration, same reason.
+#   clf_*                the classification task this branch exists to drop.
+#   nn_mlp_log / _huber / _weighted, nn_conv*, nn_mlp_heavy_reg
+#       loss and notebook ablations, already measured at trajl=1.
+# At trajl=8 every arm here is expensive enough that "run them all" is not a
+# sensible default: list the ones you want.
+DEFAULT_ARMS: List[str] = [
+    "constant", "lasso_classical", "lasso_vae", "rf_vae",     # baselines
+    "published_crossfit",                                     # the two-stage reference
+    "nn_mlp", "nn_mlp_hist",                                  # flat, no time axis
+    "nn_snapshot", "nn_snapshot_hist",                        # shared per-snapshot encoder
+    "nn_snapshot_attn_hist",                                  # + attention pooling (control)
+    "nn_tconv", "nn_tconv_hist",                              # convolution along time
+    "nn_transformer", "nn_transformer_hist",                  # attention among snapshots
+    "nn_transformer_noattn",                                  # ... with the attention ablated
+]
+
+ALL_ARMS: List[str] = list(ARMS)
 
 
 def make_arm(name: str) -> Arm:
