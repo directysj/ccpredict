@@ -31,7 +31,8 @@ with a (3, 1) kernel on (d, 1, 1) is the same operation. Flattening is done
 channels-last, as Keras does, so weights can be copied between the two.
 
 Floating-point kernels still differ between frameworks, so results are
-statistically, not bitwise, equivalent; tests/parity checks both levels.
+statistically, not bitwise, equivalent; the Keras-parity suite that checked
+that is on branch ccp_torch.
 """
 from __future__ import annotations
 
@@ -619,7 +620,7 @@ def train(model: FeedForwardNet, X_tr: np.ndarray, y_tr: np.ndarray, X_val: np.n
     per-training-row loss weights; validation is always unweighted.
 
     shuffle=False (rows in order every epoch) exists only so the whole loop can
-    be compared step for step with Keras' fit(shuffle=False) in tests/parity."""
+    be compared step for step with Keras' fit(shuffle=False)."""
     if epochs < 1:
         raise ValueError(f"epochs must be at least 1, got {epochs}")
     obj = objective or ClassificationObjective(model.out.out_features)

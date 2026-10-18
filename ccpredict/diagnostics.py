@@ -28,46 +28,6 @@ def trajectory_overlap(trajectories: Sequence[np.ndarray]) -> dict:
     }
 
 
-def label_distribution(y: np.ndarray, boundaries: Sequence[float]) -> dict:
-    y = np.asarray(y, float)
-    cls = np.digitize(y, np.asarray(boundaries))
-    return {
-        "n": int(y.size),
-        "mean": float(y.mean()),
-        "quantiles_1_5_25_50_75_95_99": np.percentile(y, [1, 5, 25, 50, 75, 95, 99]).round(4).tolist(),
-        "class_fractions": (np.bincount(cls, minlength=len(boundaries) + 1) / y.size).round(4).tolist(),
-    }
-
-
-def keras_tail_validation(y_class: np.ndarray, oversampler_name: str, strategy: str, seed: int,
-                          validation_fraction: float) -> dict:
-    """Exactly which rows Keras' validation_split takes after oversampling (notebook In [35]-[36]).
-
-    Runs the real oversampler on row indices, then takes the last fraction as
-    Keras does (split_at = floor(n * (1 - fraction))).
-    """
-    from .preprocessing import make_oversampler
-
-    sampler = make_oversampler(oversampler_name, strategy, seed)
-    n = y_class.size
-    if sampler is None:
-        idx, y_res = np.arange(n), y_class
-    else:
-        idx_res, y_res = sampler.fit_resample(np.arange(n).reshape(-1, 1), y_class)
-        idx = idx_res[:, 0]
-    split_at = int(np.floor(idx.size * (1 - validation_fraction)))
-    val_positions = np.arange(split_at, idx.size)
-    duplicated = val_positions >= n  # positions past the original rows are oversampled copies
-    val_cls = y_res[val_positions]
-    k = int(max(y_class.max(), y_res.max())) + 1
-    return {
-        "n_original": int(n), "n_after_oversampling": int(idx.size), "n_validation": int(val_positions.size),
-        "frac_validation_rows_that_are_duplicates": float(duplicated.mean()) if duplicated.size else 0.0,
-        "validation_class_fractions": (np.bincount(val_cls, minlength=k) / max(val_cls.size, 1)).round(4).tolist(),
-        "training_class_counts_before_oversampling": np.bincount(y_class, minlength=k).tolist(),
-    }
-
-
 def split_optimism(X: np.ndarray, y: np.ndarray, fold: np.ndarray, groups: np.ndarray,
                    test_sets: Dict[str, tuple], regressor_cfg, n_estimators: int = 50,
                    seed: int = 0) -> dict:

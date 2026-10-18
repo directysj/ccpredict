@@ -91,7 +91,7 @@ class FeatureConfig:
     # semantics. The notebook read frame(start) + trajl, one frame (15 min)
     # past the window, so it fitted labels shifted into the future; that is a
     # defect, not a design choice, and costs 0.03-0.05 Pearson R on simulated
-    # data. "start_plus_trajl" reproduces it and is what tests/parity pins.
+    # data. "start_plus_trajl" reproduces the notebook's off-by-one.
     label_frame: Literal["start_plus_trajl", "snippet_end"] = "snippet_end"
 
 
@@ -107,74 +107,13 @@ class SplitConfig:
 
 
 @dataclass
-class ClassifierConfig:
-    """Stage 1: CNN+DNN classifier of binned N/C ratio (In [25], [27], [32]-[37]).
+class ForestConfig:
+    """The random-forest baseline (`rf_vae`, `rf_classical`, and their `_insample` twins).
 
-    Implemented in PyTorch with the notebook's Keras defaults reproduced
-    (see cnn.py): Glorot init, BatchNorm momentum 0.99 / eps 1e-3, LeakyReLU
-    slope 0.3, L1/L2 penalties added to the loss, Keras-style Adam (eps 1e-7).
+    The paper's stage-2 hyperparameters, kept because the forest is still the
+    reference a one-stage network has to beat. No feature selection: the RFECV
+    wrapper belonged to the two-stage model and went with it.
     """
-
-    class_boundaries: Tuple[float, ...] = (0.9, 2.7)
-    # Which axis of the (trajl x nf) input the encoder works along; see
-    # cnn.FeedForwardNet. "conv" is the notebook (a width-3 kernel along the
-    # flattened vector, so almost entirely within one snapshot). The other three
-    # are alternatives to compare it with, not defaults:
-    #   "mlp"             no convolution, the flat vector into the dense layers
-    #   "snapshot_shared" one MLP per snapshot, weights shared across time
-    #   "temporal_conv"   Conv1d along time with nf input channels
-    #   "transformer"     self-attention among the snapshots of the snippet
-    encoder: Literal["conv", "mlp", "snapshot_shared", "temporal_conv",
-                     "transformer"] = "conv"
-    # The sequence encoders only; see cnn.FeedForwardNet.
-    snapshot_hidden: Tuple[int, ...] = (64,)
-    temporal_filters: Tuple[int, ...] = (64, 64)
-    temporal_kernel: int = 3
-    # encoder="transformer" only. transformer_dim must divide by transformer_heads.
-    transformer_dim: int = 64
-    transformer_heads: int = 4
-    transformer_layers: int = 2
-    transformer_ff: int = 128
-    # "none" keeps the whole block (token projection, both LayerNorms, the
-    # feed-forward sublayer) and makes only the attention sublayer the identity.
-    # The ablation that prices attention itself rather than the block around it.
-    transformer_attention: Literal["self", "none"] = "self"
-    pool: Literal["concat", "mean", "attention", "last"] = "concat"
-    conv_filters: Tuple[int, ...] = (32, 64)
-    dense_units: Tuple[int, ...] = (128, 64)
-    dropout: float = 0.2
-    # Regularisers alternate within each block: conv1 l2, conv2 l1, dense1 l2, dense2 l1.
-    regularizers: Tuple[Tuple[str, float], ...] = (("l2", 0.01), ("l1", 0.02))
-    learning_rate: float = 1e-3
-    epochs: int = 50
-    batch_size: int = 20
-    validation_fraction: float = 0.2
-    patience: int = 15
-    min_delta: float = 1e-3
-    oversampler: Literal["random", "smote", "kmeans_smote", "adasyn", "none"] = "random"
-    oversampling_strategy: str = "not majority"
-    oversampling_seed: int = 42
-    # NOTEBOOK DEFECT: "keras_tail" oversamples first and then takes the last
-    # 20% as validation, as Keras' validation_split did in the notebook.
-    # Oversampled duplicates are appended at the end, grouped by class, so the
-    # validation set is copies of minority-class training cells.
-    # "grouped_holdout" holds out whole trajectories first and oversamples only
-    # the training part.
-    validation: Literal["keras_tail", "grouped_holdout"] = "keras_tail"
-    # The notebook sets no seed, so its training is not reproducible. None keeps that.
-    seed: Optional[int] = None
-    # Where the CNN runs. "cpu"; "gpu" = CUDA, else Apple Metal (MPS), and fails
-    # if neither exists; "auto" = CUDA > MPS > CPU. Default "cpu" while
-    # developing on a laptop; switch to "auto" (or "gpu") for a GPU node.
-    device: Literal["cpu", "gpu", "auto"] = "cpu"
-    # PyTorch CPU threads; None = PyTorch's default (all cores).
-    num_threads: Optional[int] = None
-    verbose: int = 1
-
-
-@dataclass
-class RegressorConfig:
-    """Stage 2: RFECV random-forest regressor on [features, class probabilities] (In [42], [44] and the unexecuted cells after them)."""
 
     n_estimators: int = 100
     max_depth: Optional[int] = 20
@@ -182,38 +121,8 @@ class RegressorConfig:
     min_samples_leaf: int = 10
     max_features: str = "sqrt"
     random_state: int = 42
-    # Parallelism. n_jobs is used by every random forest (trees are built in
-    # parallel threads, which scales with cores). rfecv_n_jobs is how many CV
-    # folds RFECV runs at once; inside parallel folds each forest drops to one
-    # thread, so with many cores it is faster to run folds one at a time (1)
-    # and let the trees use all cores. The notebook used -1 for both; results
-    # are the same either way up to float summation order.
+    # Trees are built in parallel threads, which scales with cores.
     n_jobs: int = -1
-    rfecv_n_jobs: Optional[int] = 1
-    cv_splits: int = 5
-    cv_seed: int = 42
-    rfecv_step: int = 1
-    min_features_to_select: int = 50
-    scoring: str = "neg_mean_squared_error"
-    # Where stage 2 gets its training rows, and whose stage-1 probabilities it
-    # sees. Only the last two are honest about both at once:
-    #   "test"           NOTEBOOK DEFECT: fitted on the test FOV and scored on
-    #                    the same rows, so MSE/R/R^2 are training-set numbers.
-    #   "train"          the trimmed training FOVs, but with stage 1's in-sample
-    #                    probabilities, which are more confident than the ones it
-    #                    will meet on a new FOV.
-    #   "train_crossfit" out-of-fold probabilities, one stage 1 per held-out
-    #                    training FOV: all the data, K extra classifier fits.
-    #   "train_holdout"  one stage 1 on part of the training trajectories, stage 2
-    #                    on the rest with that model's out-of-sample probabilities:
-    #                    one classifier fit, less data for each stage.
-    fit_on: Literal["test", "train", "train_crossfit", "train_holdout"] = "test"
-    # fit_on="train_holdout": the share of training *trajectories* kept for
-    # stage 2 (grouped, so no cell appears in both stages).
-    stage2_fraction: float = 0.3
-    stage2_seed: int = 42
-    # False replaces RFECV by a single forest on all features (much faster).
-    use_rfecv: bool = True
 
 
 @dataclass
@@ -265,7 +174,7 @@ class NetConfig:
     weight_clip: float = 10.0
 
     # ---- the network ----
-    # Same options as ClassifierConfig.encoder (see cnn.FeedForwardNet): "mlp",
+    # See cnn.FeedForwardNet for what each encoder does: "mlp",
     # "conv" (the notebook's, along the flattened axis), "snapshot_shared",
     # "temporal_conv", "transformer".
     encoder: Literal["mlp", "conv", "snapshot_shared", "temporal_conv",
@@ -297,7 +206,7 @@ class NetConfig:
     validation_seed: int = 42
     patience: int = 20
     min_delta: float = 1e-4
-    # None = unseeded, as ClassifierConfig.seed is. The benchmark fills it with
+    # None = unseeded, as the notebook was. The benchmark fills it with
     # BenchmarkConfig.seed, so a run's seed reaches these arms too; set it here
     # to pin one arm independently of the run.
     seed: Optional[int] = None
@@ -313,9 +222,7 @@ class PipelineConfig:
     qc: QCConfig = field(default_factory=QCConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
-    classifier: ClassifierConfig = field(default_factory=ClassifierConfig)
-    regressor: RegressorConfig = field(default_factory=RegressorConfig)
-    # Used only by the nn_* benchmark arms; the notebook pipeline ignores it.
+    forest: ForestConfig = field(default_factory=ForestConfig)
     net: NetConfig = field(default_factory=NetConfig)
 
     def to_dict(self) -> dict:
@@ -336,8 +243,15 @@ class PipelineConfig:
 
 
 # Keys that older configs may contain: old name -> new name (None = dropped).
+# The two-stage model was removed from this branch, so a config written before
+# that carries a "classifier" block and stage-2 forest keys. They are dropped
+# rather than erroring, so an old bench.json still runs the arms that remain.
 _RENAMED_KEYS = {
-    "ClassifierConfig": {"tf_intra_op_threads": "num_threads", "tf_inter_op_threads": None},
+    "ForestConfig": {"rfecv_n_jobs": None, "cv_splits": None, "cv_seed": None,
+                     "rfecv_step": None, "min_features_to_select": None,
+                     "scoring": None, "fit_on": None, "stage2_fraction": None,
+                     "stage2_seed": None, "use_rfecv": None},
+    "PipelineConfig": {"classifier": None, "regressor": "forest"},
 }
 
 

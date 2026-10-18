@@ -11,7 +11,7 @@ Outputs in --output-dir:
     report.md          readable summary
     summary.csv        per arm: mean and sd over test FOVs
     results.csv        per arm x test FOV: all metrics
-    results.json       the same, nested, with classifier metrics and run info
+    results.json       the same, nested, with run info
     diagnostics.json   data/protocol checks (trajectory overlap, label shift,
                        validation-slice composition, random-vs-grouped optimism)
     predictions/       per-row predictions and labels (optional)
@@ -37,8 +37,8 @@ import numpy as np
 from . import diagnostics as diag
 from .arms import DEFAULT_ARMS, ArmResult, Block, SplitContext, make_arm
 from .config import DEFAULT_FOV_REPLICATE, PipelineConfig, _from_dict
-from .evaluation import as_jsonable, classification_metrics, regression_report
-from .preprocessing import discretize, trim_by_histogram
+from .evaluation import as_jsonable, regression_report
+from .preprocessing import trim_by_histogram
 
 log = logging.getLogger(__name__)
 CACHE_VERSION = 1
@@ -53,7 +53,7 @@ class BenchmarkConfig:
     test_replicate: str = "EGF2"
     arms: Tuple[str, ...] = tuple(DEFAULT_ARMS)
     trim_training: bool = True
-    # Seed for the CNN when pipeline.classifier.seed is None (the notebook set none).
+    # Seed for the nn_* arms when pipeline.net.seed is None.
     seed: int = 0
     n_boot: int = 200
     min_traj_len: int = 20
@@ -81,11 +81,8 @@ class BenchmarkConfig:
     def quick(self) -> "BenchmarkConfig":
         """Tiny settings for smoke tests; numbers from a quick run mean nothing."""
         q = copy.deepcopy(self)
-        q.pipeline.classifier.epochs, q.pipeline.classifier.patience = 3, 2
-        q.pipeline.classifier.batch_size = 256
         q.pipeline.net.epochs, q.pipeline.net.patience = 3, 2
-        q.pipeline.regressor.n_estimators = 20
-        q.pipeline.regressor.rfecv_step = 64
+        q.pipeline.forest.n_estimators = 20
         q.n_boot, q.optimism_trees = 50, 10
         return q
 
@@ -206,7 +203,7 @@ KEY_METRICS = ("pearson_r", "mse", "r2", "spearman", "mae_log", "r2_log", "mean_
                "calibration_slope")
 
 
-def _flat_row(split, arm, fov, rep, clf_metrics, seconds, info):
+def _flat_row(split, arm, fov, rep, seconds, info):
     row = {"split": split, "arm": arm, "test_fov": fov, "n": rep["n"]}
     row.update({k: rep[k] for k in KEY_METRICS})
     ci = rep.get("ci95", {})
@@ -216,9 +213,6 @@ def _flat_row(split, arm, fov, rep, clf_metrics, seconds, info):
     pt = rep.get("per_trajectory", {})
     row["traj_median_r"] = pt.get("median_r")
     row["traj_frac_r_gt_0.5"] = pt.get("frac_r_gt_0.5")
-    if clf_metrics:
-        for k in ("accuracy", "majority_class_accuracy", "balanced_accuracy", "f1_macro"):
-            row[f"clf_{k}"] = clf_metrics[k]
     row["fit_seconds"] = round(seconds, 1)
     for k, v in info.items():
         if isinstance(v, (int, float, str)):
@@ -229,13 +223,9 @@ def _flat_row(split, arm, fov, rep, clf_metrics, seconds, info):
 def run_benchmark(cfg: BenchmarkConfig) -> dict:
     os.makedirs(cfg.output_dir, exist_ok=True)
     cfg.to_json(os.path.join(cfg.output_dir, "config.json"))
-    clf_cfg = copy.deepcopy(cfg.pipeline.classifier)
-    if clf_cfg.seed is None:
-        clf_cfg.seed = cfg.seed
     net_cfg = copy.deepcopy(cfg.pipeline.net)
     if net_cfg.seed is None:
         net_cfg.seed = cfg.seed
-    boundaries = clf_cfg.class_boundaries
     trim = ((cfg.pipeline.split.trim_bins, cfg.pipeline.split.trim_target_density,
              cfg.pipeline.split.trim_seed) if cfg.trim_training else None)
 
@@ -246,7 +236,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> dict:
     diagnostics = {
         "good_fovs": meta["good_fovs"], "cell_count_noise": meta["cell_count_noise"],
         "trajectory_overlap": meta["trajectory_overlap"],
-        "label_distribution": {f: diag.label_distribution(d["y"], boundaries) for f, d in fov_data.items()},
         "splits": {},
     }
     rows, nested = [], []
@@ -254,21 +243,17 @@ def run_benchmark(cfg: BenchmarkConfig) -> dict:
         log.info("split %s: train %s, test %s", split_name, train_fovs, test_fovs)
         train = make_block(fov_data, train_fovs, trim)
         tests = {f: make_block(fov_data, (f,)) for f in test_fovs}
-        sd = {"train_fovs": train_fovs, "test_fovs": test_fovs,
-              "train_label_distribution": diag.label_distribution(train.y, boundaries),
-              "keras_tail_validation": diag.keras_tail_validation(
-                  discretize(train.y, boundaries), clf_cfg.oversampler, clf_cfg.oversampling_strategy,
-                  clf_cfg.oversampling_seed, clf_cfg.validation_fraction)}
+        sd = {"train_fovs": train_fovs, "test_fovs": test_fovs}
         if cfg.run_split_optimism:
             cols = columns("vae")
             sd["split_optimism_rf_vae"] = diag.split_optimism(
                 train.X[:, cols], train.y, train.fold, train.groups,
                 {f: (b.X[:, cols], b.y) for f, b in tests.items()},
-                cfg.pipeline.regressor, n_estimators=cfg.optimism_trees, seed=cfg.seed)
+                cfg.pipeline.forest, n_estimators=cfg.optimism_trees, seed=cfg.seed)
         diagnostics["splits"][split_name] = sd
         _write_json(os.path.join(cfg.output_dir, "diagnostics.json"), diagnostics)
 
-        ctx = SplitContext(split_name, train, tests, columns, clf_cfg, cfg.pipeline.regressor,
+        ctx = SplitContext(split_name, train, tests, columns, cfg.pipeline.forest,
                            net_cfg, trajl=meta["trajl"])
         for arm_name in cfg.arms:
             arm = make_arm(arm_name)
@@ -285,13 +270,9 @@ def run_benchmark(cfg: BenchmarkConfig) -> dict:
                 b = tests[fov]
                 rep = regression_report(b.y, res.y_pred, b.traj, min_traj_len=cfg.min_traj_len,
                                         n_boot=cfg.n_boot, seed=cfg.seed)
-                clf_m = None
-                if res.proba is not None:
-                    clf_m = classification_metrics(discretize(b.y, boundaries),
-                                                   np.argmax(res.proba, axis=1), len(boundaries) + 1)
-                rows.append(_flat_row(split_name, arm_name, fov, rep, clf_m, seconds, res.info))
-                nested.append({"split": split_name, "arm": arm_name, "test_fov": fov, "regression": rep,
-                               "classification": clf_m, "info": res.info, "fit_seconds": seconds})
+                rows.append(_flat_row(split_name, arm_name, fov, rep, seconds, res.info))
+                nested.append({"split": split_name, "arm": arm_name, "test_fov": fov,
+                               "regression": rep, "info": res.info, "fit_seconds": seconds})
                 if cfg.save_predictions:
                     pdir = os.path.join(cfg.output_dir, "predictions")
                     os.makedirs(pdir, exist_ok=True)
@@ -325,7 +306,7 @@ def summarize(rows: List[dict]) -> List[dict]:
         by_arm.setdefault((r["split"], r["arm"]), []).append(r)
     for (split, arm), rs in by_arm.items():
         s = {"split": split, "arm": arm, "n_test_fovs": len(rs)}
-        for k in ("pearson_r", "mse", "r2", "spearman", "mae_log", "traj_median_r", "clf_balanced_accuracy"):
+        for k in ("pearson_r", "mse", "r2", "spearman", "mae_log", "traj_median_r"):
             vals = np.array([r[k] for r in rs if r.get(k) is not None], float)
             if vals.size:
                 s[f"{k}_mean"] = float(vals.mean())
@@ -358,10 +339,8 @@ def write_report(cfg: BenchmarkConfig, rows: List[dict], diagnostics: dict) -> s
     lines = ["# ccpredict benchmark", "",
              f"Scheme: `{cfg.scheme}`; training labels trimmed: {cfg.trim_training}; "
              f"snippet length: {cfg.pipeline.features.trajl}; label frame: `{cfg.pipeline.features.label_frame}`; "
-             f"CNN device: `{cfg.pipeline.classifier.device}`, batch {cfg.pipeline.classifier.batch_size}; "
              f"nn_* device: `{cfg.pipeline.net.device}`, batch {cfg.pipeline.net.batch_size}, "
-             f"seed {cfg.pipeline.net.seed if cfg.pipeline.net.seed is not None else cfg.seed}; "
-             f"RFECV step: {cfg.pipeline.regressor.rfecv_step}.",
+             f"seed {cfg.pipeline.net.seed if cfg.pipeline.net.seed is not None else cfg.seed}.",
              "", "R and MSE are on raw N/C (the paper's metrics). The 95% interval resamples whole "
              "trajectories. `*_insample` arms are fitted on the rows they are scored on.", ""]
     test_fovs = list(dict.fromkeys(r["test_fov"] for r in rows))
@@ -378,32 +357,12 @@ def write_report(cfg: BenchmarkConfig, rows: List[dict], diagnostics: dict) -> s
         lines.append(f"| {s['arm']} | " + " | ".join(cells) +
                      f" | {_fmt(s.get('pearson_r_mean'))} | {_fmt(s.get('mse_mean'))} | {_fmt(s.get('r2_mean'))} | "
                      f"{_fmt(s.get('traj_median_r_mean'))} | {secs:.0f} |")
-    clf_rows = [r for r in rows if r.get("clf_accuracy") is not None]
-    if clf_rows:
-        lines += ["", "## Stage-1 classifier on the test FOVs", "",
-                  "| arm | test FOV | accuracy | majority-class accuracy | balanced accuracy | macro F1 |",
-                  "|---|---|---|---|---|---|"]
-        seen = set()
-        for r in clf_rows:
-            key = (r["split"], r["test_fov"], r.get("info_classifier_epochs"), r["arm"].endswith("groupedval"))
-            if key in seen:
-                continue
-            seen.add(key)
-            lines.append(f"| {r['arm']} | {r['test_fov']} | {_fmt(r['clf_accuracy'])} | "
-                         f"{_fmt(r['clf_majority_class_accuracy'])} | {_fmt(r['clf_balanced_accuracy'])} | "
-                         f"{_fmt(r['clf_f1_macro'])} |")
     lines += ["", "## Diagnostics", ""]
     for split, sd in diagnostics.get("splits", {}).items():
-        kt = sd["keras_tail_validation"]
-        lines.append(f"- **{split}**, notebook validation slice: {kt['frac_validation_rows_that_are_duplicates']:.0%} "
-                     f"of validation rows are oversampled duplicates; class mix {kt['validation_class_fractions']}.")
         opt = sd.get("split_optimism_rf_vae")
         if opt:
             lines.append("- **" + split + "**, forest R by validation scheme: " +
                          ", ".join(f"{k} {v:.3f}" for k, v in opt.items()) + ".")
-        td = sd["train_label_distribution"]
-        lines.append(f"- **{split}**, trimmed training labels: mean {td['mean']:.3f}, class fractions "
-                     f"{td['class_fractions']}.")
     for f, d in diagnostics.get("label_distribution", {}).items():
         ov = diagnostics.get("trajectory_overlap", {}).get(f, {})
         lines.append(f"- {f}: n {d['n']}, mean N/C {d['mean']:.3f}, class fractions {d['class_fractions']}, "

@@ -36,29 +36,6 @@ def trim_by_histogram(values: np.ndarray, num_bins: int, target_density: int,
     return trimmed["original_index"].to_numpy(dtype=int)
 
 
-def discretize(values: np.ndarray, boundaries: Sequence[float]) -> np.ndarray:
-    """Class label per value: 0 below boundaries[0], ..., len(boundaries) at or above the last.
-
-    Equivalent to the notebook's class_conditions + np.select. The notebook
-    silently put NaN into class 0; here NaN raises.
-    """
-    values = np.asarray(values, dtype=float)
-    if np.isnan(values).any():
-        raise ValueError("NaN in values to discretize")
-    return np.digitize(values, np.asarray(boundaries, dtype=float), right=False).astype(int)
-
-
-def make_oversampler(name: str, strategy: str, seed: int):
-    """imblearn oversampler by name; 'none' returns None."""
-    if name == "none":
-        return None
-    from imblearn.over_sampling import ADASYN, SMOTE, KMeansSMOTE, RandomOverSampler
-
-    cls = {"random": RandomOverSampler, "smote": SMOTE,
-           "kmeans_smote": KMeansSMOTE, "adasyn": ADASYN}[name]
-    return cls(random_state=seed, sampling_strategy=strategy)
-
-
 @dataclass
 class TrainTestData:
     """Scaled, trimmed training set and scaled test set (end state of In [23])."""

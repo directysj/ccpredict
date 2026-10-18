@@ -87,7 +87,7 @@ def main(argv=None) -> None:
     ap.add_argument("--seed", type=int, default=0, help="seed for the MLP (the forest has its own)")
     args = ap.parse_args(argv)
 
-    from ccpredict.config import RegressorConfig, _from_dict
+    from ccpredict.config import ForestConfig, _from_dict
     from ccpredict.simulate import ReplicateParams, SimConfig, simulate
 
     with open(args.simulation) as fh:
@@ -112,7 +112,7 @@ def main(argv=None) -> None:
     from ccpredict.config import NetConfig
     from ccpredict.models import DirectRegressor
     from ccpredict.preprocessing import trajectory_groups
-    reg = RegressorConfig()
+    reg = ForestConfig()
     # Trajectory ids restart in every FOV, so make them unique the same way the
     # package does (a fixed 1000-per-FOV offset collides past 1000 trajectories).
     g_train = np.concatenate([trajectory_groups(np.full(groups[f].size, i), groups[f])

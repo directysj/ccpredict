@@ -22,11 +22,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
-# Only for tests/parity (the notebook reference and the Keras-vs-PyTorch checks).
-parity = ["tensorflow", "keras>=3"]
 
 [project.scripts]
-ccpredict = "ccpredict.__main__:main"
+ccpredict = "ccpredict.benchmark:main"
 
 [tool.setuptools]
 packages = ["ccpredict"]

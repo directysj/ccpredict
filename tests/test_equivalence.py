@@ -15,7 +15,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from ccpredict.data import match_labels, read_reporter_file, sliding_snippets  # noqa: E402
-from ccpredict.preprocessing import discretize, trim_by_histogram  # noqa: E402
+from ccpredict.preprocessing import trim_by_histogram  # noqa: E402
 
 
 # ---------------------------------------------------------------- notebook code, verbatim
@@ -77,21 +77,6 @@ def nb_trim_cc_vals(ratio_values, num_bins, target_density):
         trimmed_data.append(sampled_data)
     return pd.concat(trimmed_data).sort_values('original_index')
 
-
-def nb_class_conditions(data, boundaries):
-    conditions = []
-    if len(boundaries) == 1:
-        conditions.append(data < boundaries[0]); conditions.append(data >= boundaries[0])
-    else:
-        for i in range(len(boundaries) + 1):
-            if i == 0:
-                condition = data < boundaries[i]
-            elif i == len(boundaries):
-                condition = data >= boundaries[i-1]
-            else:
-                condition = (data >= boundaries[i-1]) & (data < boundaries[i])
-            conditions.append(condition)
-    return conditions
 
 
 # ---------------------------------------------------------------- tests
@@ -180,16 +165,3 @@ def test_trim_matches_notebook(density):
     idx = trim_by_histogram(y, 50, density, seed=42)
     assert np.array_equal(ref["original_index"].to_numpy(), idx)
     assert np.array_equal(ref["CC"].to_numpy(), y[idx])
-
-
-@pytest.mark.parametrize("boundaries", [[0.9], [0.9, 2.7], [0.5, 1.0, 2.0, 3.0]])
-def test_discretize_matches_notebook(boundaries):
-    y = np.concatenate([np.exp(np.random.default_rng(0).normal(0.3, 0.6, 4000)), boundaries])
-    labels = list(range(len(boundaries) + 1))
-    ref = np.select(nb_class_conditions(y, boundaries), labels)
-    assert np.array_equal(ref, discretize(y, boundaries))
-
-
-def test_discretize_rejects_nan():
-    with pytest.raises(ValueError):
-        discretize(np.array([1.0, np.nan]), [0.9, 2.7])

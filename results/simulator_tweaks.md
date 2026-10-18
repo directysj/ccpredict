@@ -1,5 +1,14 @@
 # Fixing the task and the architecture: what it bought on the simulator
 
+> **Kept as a record; measured before this branch dropped the two-stage model.**
+> The `published_*`, `clf_*` and stage-2 arms discussed below no longer exist
+> here — they are on `ccp_torch`. Their numbers are why the one-stage branch
+> exists (the published R is largely an in-sample artefact) and why its defaults
+> are what they are, so the file stays. Everything about the `nn_*` arms, the
+> label-frame fix and the ceiling still applies, with the caveats now in
+> CLAUDE.md: single fits rank nothing, and the "ceiling" bounds two model
+> classes rather than what is achievable.
+
 Every number below is cross-replicate (train on the A wells, test on each B
 well separately), Pearson R on the raw N/C ratio, nothing fitted on the rows it
 is scored on. Simulated data (`python -m ccpredict.simulate sim/ --scale 0.25

@@ -1,6 +1,7 @@
 """Metrics, splits, diagnostics, simulator and a CPU-only benchmark smoke test.
 
-None of these need TensorFlow (the CNN tests need PyTorch). Run with: pytest tests/
+One-stage regression only: this branch has no classifier and no forest stage 2.
+The network tests need PyTorch. Run with: pytest tests/
 """
 from __future__ import annotations
 
@@ -15,8 +16,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from ccpredict import diagnostics as diag  # noqa: E402
 from ccpredict.benchmark import BenchmarkConfig, column_selector, make_block, make_splits  # noqa: E402
-from ccpredict.evaluation import (classification_metrics, per_trajectory_r,  # noqa: E402
-                                  regression_report, trajectory_bootstrap)
+from ccpredict.evaluation import (per_trajectory_r, regression_report,  # noqa: E402
+                                  trajectory_bootstrap)
 
 
 # ---------------------------------------------------------------- metrics
@@ -74,14 +75,6 @@ def test_regression_report_keys_and_log_metrics():
     assert abs(rep["mae_log"] - np.mean(np.abs(np.log(y) - np.log(yhat)))) < 1e-12
 
 
-def test_classification_metrics_majority_baseline():
-    y_true = np.array([1] * 95 + [0] * 3 + [2] * 2)
-    y_pred = np.ones(100, dtype=int)
-    m = classification_metrics(y_true, y_pred, 3)
-    assert m["accuracy"] == m["majority_class_accuracy"] == 0.95
-    assert abs(m["balanced_accuracy"] - 1 / 3) < 1e-12
-
-
 # ---------------------------------------------------------------- splits and blocks
 FOVS = ["A2_1", "A2_2", "A2_3", "B2_1", "B2_3", "B2_4"]
 
@@ -113,12 +106,6 @@ def test_column_selector_layout():
 
 
 # ---------------------------------------------------------------- diagnostics
-def test_keras_tail_validation_is_last_class_duplicates():
-    y = np.array([1] * 1000 + [0] * 30 + [2] * 20)
-    out = diag.keras_tail_validation(y, "random", "not majority", 42, 0.2)
-    assert out["n_after_oversampling"] == 3000
-    assert out["frac_validation_rows_that_are_duplicates"] == 1.0
-    assert out["validation_class_fractions"] == [0.0, 0.0, 1.0]
 
 
 def test_trajectory_overlap():
@@ -127,21 +114,24 @@ def test_trajectory_overlap():
 
 
 # ---------------------------------------------------------------- grouped validation guard
-def test_grouped_holdout_requires_groups():
-    pytest.importorskip("torch")
-    from ccpredict.config import ClassifierConfig
-    from ccpredict.models import StageOneClassifier
+def test_old_two_stage_config_still_loads():
+    """A bench.json written before the two-stage model was removed carries a
+    "classifier" block and stage-2 forest keys. They are dropped, not an error,
+    so an old config still runs the arms that remain."""
+    from ccpredict.config import ForestConfig, PipelineConfig
 
-    cfg = ClassifierConfig(validation="grouped_holdout", epochs=1, verbose=0)
-    with pytest.raises(ValueError, match="groups"):
-        StageOneClassifier(cfg, 3).fit(np.random.rand(30, 8), np.repeat([0, 1, 2], 10))
+    cfg = PipelineConfig.from_dict({
+        "fovs": ["A2_1"],
+        "classifier": {"epochs": 2, "class_boundaries": [0.9, 2.7]},
+        "regressor": {"n_estimators": 55, "use_rfecv": True, "rfecv_step": 1,
+                      "fit_on": "test", "min_features_to_select": 50},
+    })
+    assert not hasattr(cfg, "classifier")
+    assert cfg.forest.n_estimators == 55            # the forest knobs carry over
+    assert cfg.forest == ForestConfig(n_estimators=55)
 
 
 # ---------------------------------------------------------------- compute device
-def test_classifier_runs_on_cpu_by_default():
-    from ccpredict.config import ClassifierConfig
-
-    assert ClassifierConfig().device == "cpu"
 
 
 def test_select_device():
@@ -154,11 +144,6 @@ def test_select_device():
     assert select_device("auto").type in ("cpu", "cuda", "mps")
 
 
-def test_old_tensorflow_thread_keys_still_load():
-    from ccpredict.config import ClassifierConfig, _from_dict
-
-    cfg = _from_dict(ClassifierConfig, {"tf_intra_op_threads": 4, "tf_inter_op_threads": 2})
-    assert cfg.num_threads == 4
 
 
 def _tiny_problem(seed=0, n=600, d=32):
@@ -168,44 +153,6 @@ def _tiny_problem(seed=0, n=600, d=32):
     return X, y
 
 
-def _quick_cfg(**kw):
-    from ccpredict.config import ClassifierConfig
-
-    return ClassifierConfig(epochs=3, patience=2, batch_size=64, verbose=0, seed=7, **kw)
-
-
-def test_cnn_regularisers_follow_the_notebook():
-    pytest.importorskip("torch")
-    from ccpredict.config import ClassifierConfig
-    from ccpredict.models import build_cnn_classifier
-
-    m = build_cnn_classifier(32, 3, ClassifierConfig())
-    kinds = [(type(layer).__name__, kind, lam) for layer, (kind, lam) in m._penalties]
-    assert kinds == [("Conv1d", "l2", 0.01), ("Conv1d", "l1", 0.02),
-                     ("Linear", "l2", 0.01), ("Linear", "l1", 0.02)]
-    manual = sum(lam * (layer.weight.abs().sum() if kind == "l1" else (layer.weight ** 2).sum())
-                 for layer, (kind, lam) in m._penalties)
-    assert abs(manual.item() - m.penalty().item()) < 1e-6
-
-
-@pytest.mark.parametrize("validation", ["keras_tail", "grouped_holdout"])
-def test_classifier_is_deterministic_with_a_seed(validation, tmp_path):
-    pytest.importorskip("torch")
-    from ccpredict.models import StageOneClassifier
-
-    X, y = _tiny_problem()
-    groups = np.arange(len(y)) // 10
-    a = StageOneClassifier(_quick_cfg(validation=validation), 3).fit(X, y, groups)
-    b = StageOneClassifier(_quick_cfg(validation=validation), 3).fit(X, y, groups)
-    pa, pb = a.predict_proba(X), b.predict_proba(X)
-    assert pa.dtype == np.float32 and pa.shape == (len(y), 3)
-    assert np.allclose(pa.sum(1), 1, atol=1e-5)
-    assert np.array_equal(pa, pb)
-    assert {"loss", "val_loss", "accuracy", "val_accuracy", "best_epoch"} <= set(a.history)
-
-    a.save(str(tmp_path))
-    c = StageOneClassifier.load(str(tmp_path), _quick_cfg(validation=validation))
-    assert np.array_equal(pa, c.predict_proba(X))
 
 
 # ---------------------------------------------------------------- one-stage neural regressor
@@ -224,21 +171,22 @@ def _net_cfg(**kw):
 
 
 def test_net_config_defaults_depart_from_the_notebook_deliberately():
-    from ccpredict.config import ClassifierConfig, NetConfig
+    from ccpredict.config import NetConfig
 
-    cfg, notebook = NetConfig(), ClassifierConfig()
+    cfg = NetConfig()
     assert cfg.encoder == "mlp"                       # no convolution along the latent index
     assert cfg.norm_position == "before_activation" and cfg.conv_bias is False
-    assert cfg.validation == "grouped_holdout"        # not the oversampled tail
-    # Much lighter than the notebook's l2 0.01 / l1 0.02.
-    assert max(lam for _, lam in cfg.regularizers) < max(lam for _, lam in notebook.regularizers) / 10
+    assert cfg.validation == "grouped_holdout"        # not the notebook's oversampled tail
+    # Much lighter than the notebook's l2 0.01 / l1 0.02, which collapsed a
+    # regression net to a constant (results/simulator_tweaks.md).
+    assert max(lam for _, lam in cfg.regularizers) <= 1e-3
 
 
 def test_pipeline_config_without_a_net_section_still_loads():
     from ccpredict.config import NetConfig, PipelineConfig
 
-    cfg = PipelineConfig.from_dict({"fovs": ["A2_1"], "classifier": {"epochs": 2}})
-    assert cfg.net == NetConfig() and cfg.classifier.epochs == 2
+    cfg = PipelineConfig.from_dict({"fovs": ["A2_1"], "forest": {"n_estimators": 2}})
+    assert cfg.net == NetConfig() and cfg.forest.n_estimators == 2
 
 
 def test_benchmark_seed_reaches_the_nn_arms():
@@ -458,9 +406,9 @@ def test_split_context_refuses_an_unset_trajl():
     transformer gets a single token, so nothing attends to anything. It must be
     impossible to leave it unsaid (tests/seed_spread.py did, for one sweep)."""
     from ccpredict.arms import SplitContext
-    from ccpredict.config import ClassifierConfig, NetConfig, RegressorConfig
+    from ccpredict.config import ForestConfig, NetConfig
 
-    args = ("s", None, {}, lambda f: None, ClassifierConfig(), RegressorConfig(), NetConfig())
+    args = ("s", None, {}, lambda f: None, ForestConfig(), NetConfig())
     with pytest.raises(ValueError, match="trajl must be the snippet length"):
         SplitContext(*args)
     assert SplitContext(*args, trajl=8).trajl == 8
@@ -538,75 +486,19 @@ def test_transformer_token_projection_carries_the_weight_penalty():
 def test_trajl_reaches_the_network_through_the_split_context():
     """A row of trajl*nf features must arrive at the net as trajl snapshots."""
     pytest.importorskip("torch")
-    from ccpredict.arms import ClassifierArm, SplitContext
-    from ccpredict.config import ClassifierConfig, NetConfig, RegressorConfig
-    from ccpredict.models import StageOneClassifier, build_cnn_classifier
+    from ccpredict.arms import SplitContext, make_arm
+    from ccpredict.config import ForestConfig, NetConfig
+    from ccpredict.models import DirectRegressor, build_net
 
-    cfg = ClassifierConfig(encoder="snapshot_shared")
-    assert build_cnn_classifier(8 * 32, 3, cfg, steps=8).steps == 8
-    assert StageOneClassifier(cfg, 3, steps=8).steps == 8
-    ctx = SplitContext("s", None, {}, lambda f: None, cfg, RegressorConfig(), NetConfig(), trajl=8)
+    cfg = NetConfig(encoder="snapshot_shared")
+    assert build_net(8 * 32, 1, cfg, steps=8).steps == 8
+    assert DirectRegressor(cfg, steps=8).steps == 8
+    ctx = SplitContext("s", None, {}, lambda f: None, ForestConfig(), NetConfig(), trajl=8)
     assert ctx.trajl == 8
-    assert ClassifierArm("temporal_conv").cfg(ctx).encoder == "temporal_conv"
-
-
-@pytest.mark.parametrize("encoder", ["snapshot_shared", "temporal_conv", "transformer"])
-def test_classifier_trains_with_a_sequence_encoder(encoder, tmp_path):
-    """End to end on trajl=4 rows, including the save/load roundtrip (the model
-    shape depends on steps, so a checkpoint has to carry it)."""
-    pytest.importorskip("torch")
-    from ccpredict.models import StageOneClassifier
-
-    steps, nf = 4, 8
-    rng = np.random.default_rng(0)
-    y = rng.choice(3, 400, p=[0.1, 0.8, 0.1])
-    X = rng.random((400, steps * nf)) + 0.3 * y[:, None]
-    groups = np.arange(400) // 10
-    cfg = _quick_cfg(encoder=encoder, validation="grouped_holdout")
-    clf = StageOneClassifier(cfg, 3, steps).fit(X, y, groups)
-    proba = clf.predict_proba(X)
-    assert proba.shape == (400, 3) and np.allclose(proba.sum(1), 1, atol=1e-5)
-
-    clf.save(str(tmp_path))
-    loaded = StageOneClassifier.load(str(tmp_path), cfg)
-    assert loaded.steps == steps
-    assert np.array_equal(proba, loaded.predict_proba(X))
+    assert make_arm("nn_transformer").cfg(ctx).encoder == "transformer"
 
 
 # ------------------------------------------------- stage-2 holdout
-def test_stage2_split_keeps_whole_trajectories_apart():
-    from ccpredict.models import stage2_split
-
-    groups = np.repeat(np.arange(50), 8)
-    s1, s2 = stage2_split(groups, 0.3, seed=42)
-    assert s1.size + s2.size == groups.size
-    assert not set(groups[s1]) & set(groups[s2])          # no cell in both stages
-    assert 0.2 < s2.size / groups.size < 0.4
-    assert np.array_equal(stage2_split(groups, 0.3, 42)[1], s2)   # deterministic
-    with pytest.raises(ValueError, match="groups"):
-        stage2_split(None, 0.3, 42)
-    with pytest.raises(ValueError, match="stage2_fraction"):
-        stage2_split(groups, 0.0, 42)
-
-
-def test_published_holdout_trains_stage1_on_fewer_rows_than_crossfit():
-    """The holdout arm must not reuse the classifier the other arms trained on all
-    rows, or stage 2 would learn from in-sample probabilities after all."""
-    from ccpredict.arms import PublishedArm, SplitContext
-    from ccpredict.config import ClassifierConfig, NetConfig, RegressorConfig
-
-    rng = np.random.default_rng(0)
-    from ccpredict.arms import Block
-    n = 400
-    train = Block(rng.random((n, 8)), 1 + rng.random(n), np.zeros(n, int),
-                  np.arange(n) // 10, ("A",))
-    ctx = SplitContext("s", train, {}, lambda f: np.arange(8), ClassifierConfig(),
-                       RegressorConfig(), NetConfig(), trajl=1)
-    crossfit, holdout = PublishedArm("train_crossfit"), PublishedArm("train_holdout")
-    assert crossfit._rows_for_stage1(ctx) == (None, None)
-    s1, s2 = holdout._rows_for_stage1(ctx)
-    assert s1.size + s2.size == n and s1.size > s2.size
-    assert holdout.name == "published_holdout"
 
 
 def test_no_regularisers_means_no_penalty():
@@ -636,7 +528,7 @@ def test_conv_bias_is_dead_when_batchnorm_comes_first():
     subtracts the batch mean, so a per-channel constant added before it cannot
     change any output. With the notebook's order the activation sits in between,
     so the bias does something (except for filters that never leave the linear
-    branch -- see tests/parity/test_torch_port.py)."""
+    branch -- see tests/parity/test_torch_port.py on `ccp_torch`)."""
     torch = pytest.importorskip("torch")
     from ccpredict.models import build_net
 
@@ -776,10 +668,9 @@ def test_grouped_validation_requires_groups_but_random_rows_does_not():
 
 def test_neural_arms_differ_only_by_their_overrides():
     from ccpredict.arms import NEURAL_ARMS, SplitContext, make_arm
-    from ccpredict.config import ClassifierConfig, NetConfig, RegressorConfig
+    from ccpredict.config import ForestConfig, NetConfig
 
-    ctx = SplitContext("s", None, {}, lambda f: None, ClassifierConfig(), RegressorConfig(),
-                       NetConfig(), trajl=1)
+    ctx = SplitContext("s", None, {}, lambda f: None, ForestConfig(), NetConfig(), trajl=1)
     base = NetConfig()
     for name, overrides in NEURAL_ARMS.items():
         cfg = make_arm(name).cfg(ctx)
@@ -794,14 +685,6 @@ def test_neural_arms_differ_only_by_their_overrides():
         from ccpredict.arms import NeuralArm
 
         NeuralArm("bogus", no_such_field=1).cfg(ctx)
-
-
-def test_rfecv_runs_folds_serially_and_trees_in_parallel():
-    from ccpredict.config import RegressorConfig
-    from ccpredict.models import StageTwoRegressor
-
-    reg = StageTwoRegressor(RegressorConfig())
-    assert reg.rfecv.n_jobs == 1 and reg.rfecv.estimator.n_jobs == -1
 
 
 # ---------------------------------------------------------------- simulator

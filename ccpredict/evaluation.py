@@ -16,44 +16,6 @@ import numpy as np
 # Metrics
 # ----------------------------------------------------------------------------
 
-def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, num_classes: int) -> dict:
-    """Accuracy, weighted precision/recall/F1 and row-normalised confusion matrix.
-
-    Precision uses zero_division=np.nan as in the notebook. sklearn then drops
-    classes that were never predicted from the weighted average, so precision
-    is averaged only over predicted classes and is biased upward. Per-class
-    values and support are returned so this is visible.
-    """
-    from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
-                                 precision_recall_fscore_support, precision_score, recall_score)
-
-    labels = list(range(num_classes))
-    p, r, f, support = precision_recall_fscore_support(
-        y_true, y_pred, labels=labels, zero_division=np.nan)
-    from sklearn.metrics import balanced_accuracy_score
-
-    counts = np.bincount(np.asarray(y_true, int), minlength=num_classes)
-    return {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        # What predicting the most common true class for every cell would score.
-        "majority_class_accuracy": float(counts.max() / counts.sum()),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "f1_macro": float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)),
-        "precision_weighted_zero_division_0": float(precision_score(
-            y_true, y_pred, labels=labels, average="weighted", zero_division=0)),
-        "precision_weighted": float(precision_score(y_true, y_pred, average="weighted",
-                                                    zero_division=np.nan)),
-        "recall_weighted": float(recall_score(y_true, y_pred, average="weighted")),
-        "f1_weighted": float(f1_score(y_true, y_pred, average="weighted")),
-        "per_class": {
-            "precision": [float(v) for v in p], "recall": [float(v) for v in r],
-            "f1": [float(v) for v in f], "support": [int(v) for v in support],
-            "n_predicted": [int(np.sum(y_pred == c)) for c in labels],
-        },
-        "confusion_matrix_true_normalized": confusion_matrix(
-            y_true, y_pred, labels=labels, normalize="true").tolist(),
-    }
-
 
 def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     from sklearn.metrics import mean_squared_error, r2_score
@@ -175,33 +137,6 @@ def _log_ratio_axis(ax):
     ax.xaxis.set_minor_locator(ticker.MultipleLocator(0.25))
 
 
-def plot_label_distributions(y_train: np.ndarray, y_test: np.ndarray,
-                             train_name: str = "Training", test_name: str = "Test"):
-    """Histograms of the N/C ratio, training (trimmed) vs test (In [24])."""
-    import matplotlib.pyplot as plt
-
-    fig, axs = plt.subplots(1, 2, figsize=(20, 8))
-    for ax, values, title in ((axs[0], y_train, train_name), (axs[1], y_test, test_name)):
-        ax.hist(values, bins=100, density=True)
-        _log_ratio_axis(ax)
-        ax.set_xlabel("N/C Ratio")
-        ax.set_ylabel("Density")
-        ax.set_title(title)
-    fig.tight_layout()
-    return fig
-
-
-def plot_confusion_matrix(conf_matrix, title: str = "Confusion Matrix: Pred. vs Act. N/C ratio of Test Set"):
-    import matplotlib.pyplot as plt
-    from sklearn.metrics import ConfusionMatrixDisplay
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ConfusionMatrixDisplay(np.asarray(conf_matrix)).plot(ax=ax)
-    ax.set_title(title)
-    fig.tight_layout()
-    return fig
-
-
 def plot_training_history(history: dict):
     import matplotlib.pyplot as plt
 
@@ -256,22 +191,6 @@ def plot_regression(y_true: np.ndarray, y_pred: np.ndarray, title: str,
     return fig
 
 
-def plot_rfecv_scores(rfecv):
-    """Cross-validated score vs number of selected features (last unexecuted plotting cell, axis labels corrected)."""
-    import matplotlib.pyplot as plt
-
-    results = rfecv.cv_results_
-    n_features = np.asarray(results["n_features"]) if "n_features" in results else (
-        np.arange(len(results["mean_test_score"])) + rfecv.min_features_to_select)
-    fig, ax = plt.subplots(figsize=(5, 4))
-    ax.errorbar(n_features, results["mean_test_score"], yerr=results["std_test_score"])
-    ax.set_xlabel("Number of features selected")
-    ax.set_ylabel(f"Mean CV score ({rfecv.scoring})")
-    ax.set_title("RFECV feature elimination")
-    fig.tight_layout()
-    return fig
-
-
 def save_figure(fig, path: str, dpi: int = 400) -> None:
     import matplotlib.pyplot as plt
 
@@ -292,7 +211,6 @@ def as_jsonable(obj):
 
 
 __all__: Sequence[str] = (
-    "classification_metrics", "regression_metrics", "plot_label_distributions",
-    "plot_confusion_matrix", "plot_training_history", "plot_regression", "plot_rfecv_scores",
-    "save_figure",
+    "regression_metrics", "regression_report", "per_trajectory_r", "trajectory_bootstrap",
+    "plot_training_history", "plot_regression", "save_figure", "as_jsonable",
 )
